@@ -1,0 +1,23 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+data/raw/
+data/cache/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+chroma_db/
+*.onnx
+*.pt
+*.safetensors
+*.ckpt
+.ipynb_checkpoints/
+# Experiment runs and trial logs; may contain harmful completions (§2.7, §3.8). Never commit.
+results/

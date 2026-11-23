@@ -1,0 +1,12 @@
+# AI Use Log (§5.5)
+
+Every AI-assisted contribution is recorded here. The student reviews, edits, and owns all output before commit.
+
+Note: W1 workspace initialization slipped into W2 (§5.4); the 2026-11-23 rows are therefore logged as W2.
+
+| Date | Week | Spec IDs | Role | AI Usage |
+| --- | --- | --- | --- | --- |
+| 2026-11-23 | W2 | IP-1, IP-2, IP-6, IP-7, IP-8, IP-9, PS-1, PS-2, PS-3, PS-5, CA-1, CA-2, CA-3, TM-R1, TM-R6, TM-S3, D-PII, §2.7, §3.2, §3.9 | Reviewer | Audit of Specification Draft v3.3.2 for consistency of invariants, caps, and refusal behavior. Findings consolidated into 11 numbered rules in `AGENTS.md`. Student verified each rule against the spec text. |
+| 2026-11-23 | W2 | §5.2, §5.3, §5.5, PS-5 | Scaffolding assistant | Antigravity agent generated the W1 workspace: `AGENTS.md`, `CLAUDE.md`, `.gitignore`, empty package layout, `docs/AI_USE_LOG.md`, `docs/artifacts.md`, `requirements.in`, `requirements.txt`, `.env.example`. No application logic written. Student ran the PS-5 character check and reviewed the directory tree. |
+| 2026-11-23 | W2 | IP-3, IP-4, IP-5, IP-9, PS-2, PS-4, PS-5, TM-R2, TM-R3, TM-R4, TM-R5, TM-S1, TM-S2, TM-S4, TM-S5, D-PII, §3.2, §5.2, §5.5 | Implementation assistant | Step 2: closed the 9 Step 1 audit findings (`AGENTS.md`, `.gitignore`, `.env.example`, this log), created Python 3.11 `.venv` and a `pip-compile` lockfile, ran `git init`, implemented `contracts/` (`LayerResult`, `Outcome`, `canonical_hash`, `TelemetrySink`), the attacker AST isolation test, and `scripts/ps5_lint.py` with unit tests. No `app/`, `telemetry/`, or `harness/` runtime logic. Student to review all files and test output before first commit. |
+| 2026-11-23 | W2 | RT-V6, IP-4, IP-5, IP-9, PS-2, PS-5, TM-S3, §3.2, §5.2, §5.5 | Implementation assistant | Step 2.5: closed audit findings F1 to F7 and Minors. `scripts/ps5_lint.py` dataset skips, size cap, emoji range fix; frozen `RequestLogRecord` and `ShadowRecord` in `contracts/records.py` (field names taken from spec RT-V6 and IP-4); typed `TelemetrySink`; `canonical_hash` surrogate, integral float, and NaN handling; `Outcome` as `StrEnum`; hardened attacker isolation test; new `tests/test_package_boundaries.py`; `pytest.ini` pythonpath; `AGENTS.md` map updates. `pypdf` installed in `.venv` only to read the spec PDF (not in lockfile). No `app/` or `telemetry/` runtime code. Student to review before first commit. |
