@@ -162,9 +162,70 @@ def _is_record_item(item: Any) -> bool:
     return item is not None and not isinstance(item, _Flush)
 
 
+MANAGED_TABLES: tuple[str, ...] = ("request_logs", "shadow_records")
+
+# One `PRAGMA table_info` row reduced to the fields that define a column:
+# (name, declared type, NOT NULL flag, primary-key position).
+ColumnSpec = tuple[str, str, int, int]
+
+
 def _apply_schema_statements(conn: sqlite3.Connection) -> None:
     for statement in _SCHEMA_STATEMENTS:
         conn.execute(statement)
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> tuple[ColumnSpec, ...]:
+    return tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in conn.execute(f"PRAGMA table_info({table})")
+    )
+
+
+def _expected_table_columns() -> dict[str, tuple[ColumnSpec, ...]]:
+    """Column layout produced by `_SCHEMA_STATEMENTS`, read back from a scratch in-memory database."""
+    scratch = sqlite3.connect(":memory:")
+    try:
+        _apply_schema_statements(scratch)
+        return {table: _table_columns(scratch, table) for table in MANAGED_TABLES}
+    finally:
+        scratch.close()
+
+
+EXPECTED_TABLE_COLUMNS = _expected_table_columns()
+
+
+def _verify_table_columns(conn: sqlite3.Connection) -> None:
+    """Fail fast when any managed table is missing or its columns differ from the current schema (IP-8).
+
+    `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a database
+    whose `user_version` matches but whose tables predate a column (for example
+    `egress_action`) would otherwise fail only at the first insert.
+    """
+    problems: list[str] = []
+    for table, expected in EXPECTED_TABLE_COLUMNS.items():
+        actual = _table_columns(conn, table)
+        if not actual:
+            problems.append(f"{table}: table missing")
+            continue
+        expected_by_name = {spec[0]: spec for spec in expected}
+        actual_by_name = {spec[0]: spec for spec in actual}
+        missing = [name for name in expected_by_name if name not in actual_by_name]
+        unexpected = [name for name in actual_by_name if name not in expected_by_name]
+        mismatched = [
+            name
+            for name, spec in expected_by_name.items()
+            if name in actual_by_name and actual_by_name[name] != spec
+        ]
+        if missing:
+            problems.append(f"{table}: missing columns {missing}")
+        if unexpected:
+            problems.append(f"{table}: unexpected columns {unexpected}")
+        if mismatched:
+            problems.append(f"{table}: mismatched column definitions {mismatched}")
+    if problems:
+        raise ValueError(
+            f"telemetry schema column mismatch (user_version={SCHEMA_VERSION}): " + "; ".join(problems)
+        )
 
 
 def _set_user_version(conn: sqlite3.Connection, version: int) -> None:
@@ -196,7 +257,10 @@ def _init_and_check_schema(conn: sqlite3.Connection) -> None:
                 f"expected {SCHEMA_VERSION}"
             )
         else:
+            # Verify before the idempotent DDL so a missing table is reported, not silently recreated.
+            _verify_table_columns(conn)
             _apply_schema_statements(conn)
+        _verify_table_columns(conn)
         conn.execute("COMMIT")
     except BaseException:
         if conn.in_transaction:

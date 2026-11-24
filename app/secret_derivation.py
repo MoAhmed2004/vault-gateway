@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from faker import Faker
 import phonenumbers
 
+from contracts.datasets import PII_ENTITY_TYPES
 from contracts.modes import (
     ALL_GATEWAY_MODES,
     DETERMINISTIC_MODES,
@@ -29,7 +30,6 @@ from contracts.modes import (
     resolve_derivation_mode,
 )
 
-PII_ENTITY_TYPES = ("EMAIL_ADDRESS", "PHONE_NUMBER", "CREDIT_CARD", "US_SSN", "IBAN_CODE")
 CANARY_PREFIX = "VAULT-CANARY-"
 
 # Real US geographic area codes. The exchange is generated as [2-9]XX with the

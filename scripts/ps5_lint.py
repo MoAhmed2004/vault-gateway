@@ -17,9 +17,22 @@ etc.), and any file outside `BINARY_SUFFIXES` that is not valid UTF-8. Plain
 utilitarian status glyphs (check mark, ballot cross, black circle, black
 square, box-drawing, arrows) are allowed for the W15 SOC console.
 
-Skipped: dataset and cache directories, virtualenv, VCS, results, ChromaDB,
-`data/translations/` (hand-curated Arabic, French, Spanish text), binary and
-PDF files (`BINARY_SUFFIXES`), and any file larger than 5 MiB.
+Curated multilingual data (`CURATED_MULTILINGUAL_DIRS`): `data/translations/`
+(the pre-translated Arabic, French, Spanish table, §2.7, §3.4) and
+`data/benign/` (the hand-curated D-BEN-2 set, which includes Arabic
+translation requests, §2.2). These files are dataset text, not authored code
+or prose, so the PS-5 typography checks (emoji, em/en dash) do not apply to
+them. They are still scanned for integrity: they must be valid UTF-8, contain
+no ASCII control characters, and contain no `Cf` format character except the
+script-required marks in `CURATED_ALLOWED_FORMAT_CHARS` (ZWNJ `U+200C`, LRM
+`U+200E`, RLM `U+200F`, Arabic letter mark `U+061C`). Every other `Cf`
+character (BOM, `U+200B`, `U+200D`, bidi embeddings, overrides and isolates
+`U+202A` to `U+202E` and `U+2066` to `U+2069`, the tag block) still fails
+there, and the allowlist applies nowhere else.
+
+Skipped: uncurated dataset and cache directories (`data/raw/`, `data/cache/`),
+virtualenv, VCS, results, ChromaDB, binary and PDF files (`BINARY_SUFFIXES`),
+and any file larger than 5 MiB.
 
 TODO before W15: add text-level UI pattern checks for `linear-gradient`,
 `backdrop-filter`, `Inter`, `Space Grotesk`, `Instrument Serif`, and `lucide`.
@@ -78,13 +91,29 @@ SKIP_DIRS = frozenset(
 )
 
 # Directories skipped by path relative to the scan root (posix separators).
-# data/translations holds hand-curated multilingual text and is excluded.
+# These hold uncurated or generated data that is never tracked.
 SKIP_REL_DIRS = frozenset(
     {
         "data/raw",
         "data/cache",
-        "data/translations",
         "results",
+    }
+)
+
+# Tracked, hand-curated multilingual dataset directories (relative to the scan root).
+CURATED_MULTILINGUAL_DIRS: tuple[str, ...] = (
+    "data/translations",
+    "data/benign",
+)
+
+# Format (Cf) characters that Arabic and Persian text legitimately needs.
+# Kept identical to `contracts.datasets.CURATED_ALLOWED_FORMAT_CHARS` (tested).
+CURATED_ALLOWED_FORMAT_CHARS = frozenset(
+    {
+        "\u200c",  # ZERO WIDTH NON-JOINER (Persian, Arabic morphology)
+        "\u200e",  # LEFT-TO-RIGHT MARK (English marker text inside Arabic)
+        "\u200f",  # RIGHT-TO-LEFT MARK
+        "\u061c",  # ARABIC LETTER MARK
     }
 )
 
@@ -92,10 +121,20 @@ MAX_FILE_BYTES = 5 * 1024 * 1024
 
 BINARY_SUFFIXES = frozenset(
     {
+        # documents and images
         ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".bmp",
+        ".docx", ".xlsx", ".pptx", ".mp4",
+        # model weights and serialized arrays or objects
         ".onnx", ".pt", ".safetensors", ".ckpt", ".bin", ".dat", ".npy", ".npz",
-        ".db", ".sqlite", ".sqlite3", ".zip", ".gz", ".tar", ".whl",
-        ".pyc", ".pyd", ".so", ".dll", ".exe", ".woff", ".woff2", ".ttf",
+        ".pkl", ".pickle", ".joblib", ".parquet", ".feather", ".h5", ".gguf", ".tflite",
+        # databases
+        ".db", ".sqlite", ".sqlite3",
+        # archives
+        ".zip", ".gz", ".tar", ".tgz", ".whl", ".7z", ".rar", ".xz", ".bz2",
+        # compiled code
+        ".pyc", ".pyd", ".so", ".dll", ".exe",
+        # fonts
+        ".woff", ".woff2", ".ttf", ".otf",
     }
 )
 
@@ -122,18 +161,32 @@ class Hit:
         return f"{self.path}:{self.line}:{self.column}: U+{code:04X} {name}"
 
 
+def _is_control(char: str) -> bool:
+    code = ord(char)
+    return (code < 0x20 and char not in ("\n", "\r")) or code == 0x7F
+
+
 def is_banned(char: str) -> bool:
+    """Strict rule applied to every scanned file outside the curated multilingual directories."""
     if char in (EM_DASH, EN_DASH):
         return True
-    code = ord(char)
-    if (code < 0x20 and char not in ("\n", "\r")) or code == 0x7F:
+    if _is_control(char):
         return True
     if unicodedata.category(char) == "Cf":
         return True
+    code = ord(char)
     return any(low <= code <= high for low, high in EMOJI_RANGES)
 
 
-def scan_text(text: str, path: Path) -> list[Hit]:
+def is_banned_in_curated_data(char: str) -> bool:
+    """Integrity rule for curated multilingual data: controls and every non-allowlisted Cf character."""
+    if _is_control(char):
+        return True
+    return unicodedata.category(char) == "Cf" and char not in CURATED_ALLOWED_FORMAT_CHARS
+
+
+def scan_text(text: str, path: Path, *, curated: bool = False) -> list[Hit]:
+    banned = is_banned_in_curated_data if curated else is_banned
     hits: list[Hit] = []
     line_no = 1
     col_no = 0
@@ -145,12 +198,12 @@ def scan_text(text: str, path: Path) -> list[Hit]:
         if char == "\r":
             continue
         col_no += 1
-        if is_banned(char):
+        if banned(char):
             hits.append(Hit(path, line_no, col_no, char))
     return hits
 
 
-def scan_file(path: Path) -> list[Hit]:
+def scan_file(path: Path, *, curated: bool = False) -> list[Hit]:
     if path.suffix.lower() in BINARY_SUFFIXES:
         return []
     if path.stat().st_size > MAX_FILE_BYTES:
@@ -168,7 +221,16 @@ def scan_file(path: Path) -> list[Hit]:
                 reason=f"non-UTF-8 file ({exc.reason} at byte {exc.start})",
             )
         ]
-    return scan_text(text, path)
+    return scan_text(text, path, curated=curated)
+
+
+def is_curated_multilingual(path: Path, base: Path) -> bool:
+    """True when `path` lies inside one of `CURATED_MULTILINGUAL_DIRS` under `base`."""
+    try:
+        rel = path.resolve().relative_to(base.resolve()).as_posix()
+    except ValueError:
+        return False
+    return any(rel.startswith(f"{prefix}/") for prefix in CURATED_MULTILINGUAL_DIRS)
 
 
 def iter_files(root: Path, base: Path | None = None) -> Iterator[Path]:
@@ -184,14 +246,24 @@ def iter_files(root: Path, base: Path | None = None) -> Iterator[Path]:
             yield entry
 
 
-def lint(paths: Iterable[Path]) -> list[Hit]:
+def lint(paths: Iterable[Path], *, base: Path | None = None) -> list[Hit]:
+    """Lint files and directories. Curated-directory detection is relative to `base`.
+
+    A directory argument is its own base unless `base` is given. A file argument
+    is curated only when it lies inside a curated directory under `base`, so
+    the strict rule is the default.
+    """
     hits: list[Hit] = []
     for path in paths:
         if path.is_dir():
-            for file in iter_files(path):
-                hits.extend(scan_file(file))
+            scan_base = path
+            if base is not None and path.resolve().is_relative_to(base.resolve()):
+                scan_base = base
+            for file in iter_files(path.resolve(), scan_base.resolve()):
+                hits.extend(scan_file(file, curated=is_curated_multilingual(file, scan_base)))
         elif path.is_file():
-            hits.extend(scan_file(path))
+            curated = base is not None and is_curated_multilingual(path, base)
+            hits.extend(scan_file(path, curated=curated))
     return hits
 
 
@@ -201,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
     args = parser.parse_args(argv)
     targets = args.paths or [args.root]
-    hits = lint(targets)
+    hits = lint(targets, base=args.root)
     for hit in hits:
         print(hit.format())
     if hits:

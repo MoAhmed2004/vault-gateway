@@ -758,3 +758,108 @@ def test_atomic_first_db_initialization_rolls_back_on_mid_init_failure(monkeypat
         recovered.flush()
         assert recovered.written_count == 1
         assert len(recovered.fetch_requests()) == 1
+
+
+# Step 4 (Part A1): column-level schema verification on existing databases (IP-8)
+
+
+def _build_db(db, statements, user_version):
+    conn = sqlite3.connect(db)
+    try:
+        for statement in statements:
+            conn.execute(statement)
+        conn.execute(f"PRAGMA user_version = {user_version};")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _current_statements():
+    import telemetry.writer as writer_mod
+
+    return list(writer_mod._SCHEMA_STATEMENTS)
+
+
+def _row_count(db, table):
+    conn = sqlite3.connect(db)
+    try:
+        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_outdated_v1_database_missing_egress_action_fails_fast_before_any_insert(monkeypatch, tmp_path):
+    import re
+
+    import telemetry.writer as writer_mod
+
+    db = tmp_path / "outdated_v1.db"
+    statements = _current_statements()
+    outdated_request_ddl = re.sub(r"\s*egress_action TEXT NOT NULL,", "", statements[0])
+    assert "egress_action" not in outdated_request_ddl
+    _build_db(db, [outdated_request_ddl, *statements[1:]], user_version=SCHEMA_VERSION)
+
+    inserts = []
+    real_request_row = writer_mod._request_row
+    monkeypatch.setattr(writer_mod, "_request_row", lambda record: inserts.append(record) or real_request_row(record))
+
+    with pytest.raises(RuntimeError, match=r"column mismatch.*request_logs: missing columns \['egress_action'\]"):
+        SQLiteTelemetrySink(db)
+    assert inserts == []
+    assert _row_count(db, "request_logs") == 0
+    conn = sqlite3.connect(db)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(request_logs)")}
+    finally:
+        conn.close()
+    assert "egress_action" not in cols  # the check never migrates or alters the table
+
+
+def test_existing_database_with_mismatched_column_type_fails_fast(tmp_path):
+    db = tmp_path / "wrong_type.db"
+    statements = _current_statements()
+    statements[0] = statements[0].replace("total_latency_ms REAL NOT NULL", "total_latency_ms TEXT NOT NULL")
+    _build_db(db, statements, user_version=SCHEMA_VERSION)
+    with pytest.raises(RuntimeError, match=r"mismatched column definitions \['total_latency_ms'\]"):
+        SQLiteTelemetrySink(db)
+
+
+def test_existing_database_with_dropped_not_null_fails_fast(tmp_path):
+    db = tmp_path / "nullable.db"
+    statements = _current_statements()
+    statements[0] = statements[0].replace("egress_action TEXT NOT NULL", "egress_action TEXT")
+    _build_db(db, statements, user_version=SCHEMA_VERSION)
+    with pytest.raises(RuntimeError, match=r"mismatched column definitions \['egress_action'\]"):
+        SQLiteTelemetrySink(db)
+
+
+def test_existing_database_with_unexpected_column_fails_fast(tmp_path):
+    db = tmp_path / "extra_col.db"
+    statements = _current_statements()
+    statements[3] = statements[3].replace("objective_id TEXT\n", "objective_id TEXT,\n        legacy_flag INTEGER\n")
+    _build_db(db, statements, user_version=SCHEMA_VERSION)
+    with pytest.raises(RuntimeError, match=r"shadow_records: unexpected columns \['legacy_flag'\]"):
+        SQLiteTelemetrySink(db)
+
+
+def test_existing_versioned_database_missing_table_fails_fast_instead_of_recreating(tmp_path):
+    db = tmp_path / "missing_table.db"
+    statements = [s for s in _current_statements() if "shadow_records" not in s]
+    _build_db(db, statements, user_version=SCHEMA_VERSION)
+    with pytest.raises(RuntimeError, match="shadow_records: table missing"):
+        SQLiteTelemetrySink(db)
+    conn = sqlite3.connect(db)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+    assert "shadow_records" not in tables  # the failed startup rolled back; nothing was created
+
+
+def test_expected_columns_cover_every_record_field():
+    import telemetry.writer as writer_mod
+
+    request_cols = {spec[0] for spec in writer_mod.EXPECTED_TABLE_COLUMNS["request_logs"]}
+    shadow_cols = {spec[0] for spec in writer_mod.EXPECTED_TABLE_COLUMNS["shadow_records"]}
+    assert request_cols == {"id"} | set(RequestLogRecord.model_fields)
+    assert shadow_cols == {"id"} | set(ShadowRecord.model_fields)

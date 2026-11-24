@@ -23,6 +23,14 @@ or a live upstream provider call (`False`).
 - `Outcome.EGRESS_SAVED` requires `target_called=True`, `egress_variant` in
   `X1..X3`, and `egress_action` in `("masked", "blocked")` (§3.2 "L4 blocked or
   masked the result", §2.5 egress over-masking).
+- Layer evidence: `Blocked-ingress` with `blocked_by` in `L1..L3` requires a
+  `LayerResult` for that exact layer with `verdict="block"`, mirroring the L4
+  evidence rule for a blocked `Egress-saved`.
+- `oracle_result`, when recorded, must agree with the outcome: `Success`
+  requires `True`; `Admitted-refused` and `Egress-saved` require `False`.
+- `EgressVariantRecord`: `verdict="block"` if and only if
+  `egress_action="blocked"`; `X0` runs no scan, so it is always
+  `verdict="allow"` with `egress_action="none"`.
 
 `ShadowRecord` carries the IP-4 shadow-mode fields: L1, L2, L3 results with no
 short-circuit, and for `shadow_full_e2e` the per-variant egress verdicts (X0 to
@@ -36,6 +44,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, StringConstraints, model_validator
 
+from contracts.hashing import canonical_hash
 from contracts.layer_result import FiniteFloat, LayerResult, NonNegativeFiniteFloat, Verdict
 from contracts.modes import GatewayMode
 from contracts.outcome import Outcome
@@ -47,6 +56,7 @@ TimeoutPolicyName = Literal["P-open", "P-degrade", "P-closed"]
 
 # L4 is the single egress stage label (spec layers are named L1 to L4).
 EGRESS_STAGE = "L4"
+INGRESS_LAYERS = frozenset({"L1", "L2", "L3"})
 INGRESS_BLOCK_REASONS = frozenset(
     {"L1", "L2", "L3", "body_cap", "schema_validation", "decoded_cap", "window_cap"}
 )
@@ -59,6 +69,11 @@ BlockedBy = Literal[
     "load_shed", "p_closed", "timeout", "upstream_error", "internal_error",
 ]
 ALL_EGRESS_VARIANTS = frozenset({"X0", "X1", "X2", "X3"})
+
+# `prompt_hash` of a request refused before a prompt was parsed (body cap, schema
+# violation, or a fault before parsing). A fixed, recognizable digest, distinct
+# from the hash of any real raw view (those hash {"raw_view": <str>}).
+UNPARSED_PROMPT_HASH = canonical_hash({"raw_view": None})
 
 # SHA-256 digests: exactly 64 lowercase hex characters.
 Sha256Hex = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -105,6 +120,13 @@ class RequestLogRecord(BaseModel):
 
     @model_validator(mode="after")
     def _outcome_is_consistent(self) -> RequestLogRecord:
+        if self.oracle_result is not None:
+            # §3.2: Success means the oracle fired on the client-visible response;
+            # Admitted-refused and Egress-saved mean it did not.
+            if self.outcome == Outcome.SUCCESS and self.oracle_result is not True:
+                raise ValueError("Success requires oracle_result to be True when it is recorded")
+            if self.outcome in (Outcome.ADMITTED_REFUSED, Outcome.EGRESS_SAVED) and self.oracle_result is not False:
+                raise ValueError(f"{self.outcome.value} requires oracle_result to be False when it is recorded")
         if self.egress_variant == "X0" and self.egress_action != "none":
             raise ValueError("X0 performs no egress scan; egress_action must be 'none'")
         if not self.target_called and self.egress_action != "none":
@@ -127,6 +149,13 @@ class RequestLogRecord(BaseModel):
                 )
             if self.target_called:
                 raise ValueError("Blocked-ingress requires target_called to be False")
+            if self.blocked_by in INGRESS_LAYERS and not any(
+                r.layer == self.blocked_by and r.verdict == "block" for r in self.layer_results
+            ):
+                raise ValueError(
+                    f"Blocked-ingress with blocked_by={self.blocked_by!r} requires a {self.blocked_by} "
+                    "LayerResult with verdict='block' in layer_results"
+                )
         elif self.outcome == Outcome.EGRESS_SAVED:
             if not self.target_called:
                 raise ValueError("Egress-saved requires target_called to be True")
@@ -170,10 +199,12 @@ class EgressVariantRecord(BaseModel):
 
     @model_validator(mode="after")
     def _variant_action_is_consistent(self) -> EgressVariantRecord:
-        if self.variant == "X0" and (self.verdict == "block" or self.egress_action != "none"):
-            raise ValueError("X0 performs no egress scan; verdict cannot be 'block' and egress_action must be 'none'")
+        if self.variant == "X0" and (self.verdict != "allow" or self.egress_action != "none"):
+            raise ValueError("X0 performs no egress scan; verdict must be 'allow' and egress_action must be 'none'")
         if self.egress_action == "blocked" and self.verdict != "block":
             raise ValueError("egress_action='blocked' requires verdict='block'")
+        if self.verdict == "block" and self.egress_action != "blocked":
+            raise ValueError("verdict='block' requires egress_action='blocked'")
         if self.egress_action == "masked" and self.verdict != "allow":
             raise ValueError("egress_action='masked' requires verdict='allow'")
         return self

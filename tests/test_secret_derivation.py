@@ -9,18 +9,31 @@ import inspect
 import random
 import re
 import threading
+import warnings
 from pathlib import Path
 
 import phonenumbers
 import pytest
 from faker import Faker
-from presidio_analyzer.predefined_recognizers import (
-    CreditCardRecognizer,
-    EmailRecognizer,
-    IbanRecognizer,
-    PhoneRecognizer,
-    UsSsnRecognizer,
-)
+
+# presidio-analyzer 2.2.362 defines pydantic models with `model_*` fields, which
+# emits one known UserWarning at import time. A command-line `-W error::UserWarning`
+# overrides the matching `pytest.ini` filter, so the same narrow filter is applied
+# here around the import only; any other UserWarning still fails the run.
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message=r'Field "model_(to_presidio_entity_mapping|name)" in '
+        r"(NerModelConfiguration|HuggingFaceRecognizerConfig) has conflict with protected namespace",
+        category=UserWarning,
+    )
+    from presidio_analyzer.predefined_recognizers import (
+        CreditCardRecognizer,
+        EmailRecognizer,
+        IbanRecognizer,
+        PhoneRecognizer,
+        UsSsnRecognizer,
+    )
 
 from app.secret_derivation import (
     DETERMINISTIC_MODES,

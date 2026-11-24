@@ -200,3 +200,137 @@ def test_non_utf8_text_file_reports_violation_while_binary_allowlist_passes(tmp_
     (tmp_path / "model.onnx").write_bytes(b"\xff\xfe\x80\x00")
     assert ps5_lint.lint([tmp_path]) == []
     assert ps5_lint.main(["--root", str(tmp_path)]) == 0
+
+
+# Step 4 (Part A3): expanded binary list and curated multilingual data paths
+
+
+NEW_BINARY_SUFFIXES = (
+    ".docx", ".xlsx", ".pptx", ".pkl", ".pickle", ".joblib", ".parquet", ".feather", ".h5",
+    ".gguf", ".tflite", ".mp4", ".7z", ".rar", ".xz", ".bz2", ".tgz", ".otf",
+)
+ZWNJ = "\u200c"
+RLM = "\u200f"
+LRM = "\u200e"
+ALM = "\u061c"
+ARABIC_HELLO = "\u0645\u0631\u062d\u0628\u0627"
+PERSIAN_MIKONAM = "\u0645\u06cc" + ZWNJ + "\u06a9\u0646\u0645"  # "mi-konam" with the required ZWNJ
+
+
+@pytest.mark.parametrize("suffix", NEW_BINARY_SUFFIXES)
+def test_new_binary_suffixes_are_skipped(tmp_path, suffix):
+    assert suffix in ps5_lint.BINARY_SUFFIXES
+    (tmp_path / f"artifact{suffix}").write_bytes(b"\x80\xff\xfe\x00" + EM_DASH.encode("utf-8"))
+    assert ps5_lint.lint([tmp_path]) == []
+    assert ps5_lint.main(["--root", str(tmp_path)]) == 0
+
+
+def test_uppercase_binary_suffix_is_skipped(tmp_path):
+    (tmp_path / "MODEL.GGUF").write_bytes(b"\xff\xfe\x80")
+    assert ps5_lint.lint([tmp_path]) == []
+
+
+def test_curated_dirs_match_spec_tracked_paths():
+    assert ps5_lint.CURATED_MULTILINGUAL_DIRS == ("data/translations", "data/benign")
+    assert ps5_lint.CURATED_ALLOWED_FORMAT_CHARS == frozenset({ZWNJ, LRM, RLM, ALM})
+    assert "data/translations" not in ps5_lint.SKIP_REL_DIRS  # scanned, no longer skipped
+
+
+def test_curated_allowlist_matches_contracts_datasets():
+    from contracts.datasets import CURATED_ALLOWED_FORMAT_CHARS
+
+    assert ps5_lint.CURATED_ALLOWED_FORMAT_CHARS == CURATED_ALLOWED_FORMAT_CHARS
+
+
+@pytest.mark.parametrize("rel", ["data/translations", "data/benign", "data/benign/d_ben_2"])
+def test_curated_paths_accept_arabic_persian_zwnj_and_rlm(tmp_path, rel):
+    d = tmp_path / rel
+    d.mkdir(parents=True)
+    line = '{"text": "' + RLM + ARABIC_HELLO + " " + PERSIAN_MIKONAM + " " + LRM + "MARKER-42" + ALM + '"}\n'
+    (d / "rows.jsonl").write_text(line, encoding="utf-8")
+    assert ps5_lint.lint([tmp_path]) == []
+    assert ps5_lint.main(["--root", str(tmp_path)]) == 0
+
+
+@pytest.mark.parametrize(
+    "char",
+    [
+        "\ufeff",  # byte order mark
+        "\u200b",  # zero width space
+        "\u200d",  # zero width joiner (not on the allowlist)
+        "\u2060",  # word joiner
+        "\u202a",  # left-to-right embedding
+        "\u202b",  # right-to-left embedding
+        "\u202d",  # left-to-right override
+        "\u202e",  # right-to-left override (Trojan Source)
+        "\u2066",  # left-to-right isolate
+        "\u2067",  # right-to-left isolate
+        "\u2068",  # first strong isolate
+        "\u2069",  # pop directional isolate
+        "\U000e0041",  # tag latin capital letter A
+    ],
+)
+@pytest.mark.parametrize("rel", ["data/translations", "data/benign"])
+def test_curated_paths_still_ban_dangerous_format_characters(tmp_path, rel, char):
+    d = tmp_path / rel
+    d.mkdir(parents=True)
+    (d / "rows.jsonl").write_text('{"text": "' + ARABIC_HELLO + char + '"}\n', encoding="utf-8")
+    hits = ps5_lint.lint([tmp_path])
+    assert len(hits) == 1 and hits[0].char == char
+    assert ps5_lint.main(["--root", str(tmp_path)]) == 1
+
+
+@pytest.mark.parametrize("char", ["\x00", "\x07", "\t", "\x7f"])
+def test_curated_paths_still_ban_control_characters(tmp_path, char):
+    d = tmp_path / "data" / "translations"
+    d.mkdir(parents=True)
+    (d / "table.json").write_text('{"ar": "' + ARABIC_HELLO + char + '"}\n', encoding="utf-8")
+    assert ps5_lint.main(["--root", str(tmp_path)]) == 1
+
+
+def test_curated_paths_still_require_utf8(tmp_path):
+    d = tmp_path / "data" / "benign"
+    d.mkdir(parents=True)
+    (d / "d_ben_2.jsonl").write_bytes(ARABIC_HELLO.encode("utf-16"))
+    hits = ps5_lint.lint([tmp_path])
+    assert len(hits) == 1 and "non-UTF-8" in hits[0].format()
+
+
+@pytest.mark.parametrize("char", [ZWNJ, RLM, LRM, ALM])
+@pytest.mark.parametrize(
+    "rel",
+    ["app", "docs", "data/manifests", "data/objectives", "data", "tests", "data/translationsX", "x/data/translations"],
+)
+def test_allowlisted_marks_fail_everywhere_outside_curated_dirs(tmp_path, rel, char):
+    d = tmp_path / rel
+    d.mkdir(parents=True)
+    (d / "file.py").write_text(f"x = '{ARABIC_HELLO}{char}'\n", encoding="utf-8")
+    hits = ps5_lint.lint([tmp_path])
+    assert len(hits) == 1 and hits[0].char == char
+    assert ps5_lint.main(["--root", str(tmp_path)]) == 1
+
+
+def test_curated_rule_is_not_the_strict_rule():
+    for char in (ZWNJ, RLM, LRM, ALM):
+        assert ps5_lint.is_banned(char)
+        assert not ps5_lint.is_banned_in_curated_data(char)
+    # Dataset text is exempt from PS-5 typography (it is data, not authored prose).
+    assert not ps5_lint.is_banned_in_curated_data(EM_DASH)
+    assert not ps5_lint.is_banned_in_curated_data(EMOJI_ROCKET)
+
+
+def test_explicit_file_argument_uses_root_for_curated_detection(tmp_path):
+    d = tmp_path / "data" / "translations"
+    d.mkdir(parents=True)
+    f = d / "table.json"
+    f.write_text('{"fa": "' + PERSIAN_MIKONAM + '"}\n', encoding="utf-8")
+    assert ps5_lint.main(["--root", str(tmp_path), str(f)]) == 0
+    assert ps5_lint.lint([f]) != []  # without a base, a lone file gets the strict rule
+    assert ps5_lint.main(["--root", str(tmp_path), str(tmp_path / "data")]) == 0
+
+
+def test_subdirectory_argument_still_skips_raw_data(tmp_path):
+    raw = tmp_path / "data" / "raw"
+    raw.mkdir(parents=True)
+    (raw / "rows.jsonl").write_text(EM_DASH + "\u202e", encoding="utf-8")
+    assert ps5_lint.main(["--root", str(tmp_path), str(tmp_path / "data")]) == 0

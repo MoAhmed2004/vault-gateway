@@ -257,6 +257,8 @@ def _layer(layer="L1", verdict="allow"):
 
 
 def _variant(name="X0", verdict="allow", **kw):
+    if verdict == "block":
+        kw.setdefault("egress_action", "blocked")
     return EgressVariantRecord(
         response_hash=canonical_hash({"r": "resp"}), manifest_id="M1", variant=name, verdict=verdict, **kw
     )
@@ -601,8 +603,11 @@ def test_egress_variant_record_requires_valid_response_hash_and_manifest():
     ["L1", "L2", "L3", "body_cap", "schema_validation", "decoded_cap", "window_cap"],
 )
 def test_request_log_blocked_by_accepts_all_ingress_and_prelayer_stages(stage):
+    layers = (_layer(stage, "block"),) if stage in ("L1", "L2", "L3") else ()
     rec = RequestLogRecord(
-        **_request_kwargs(blocked_by=stage, outcome=Outcome.BLOCKED_INGRESS, target_called=False)
+        **_request_kwargs(
+            blocked_by=stage, outcome=Outcome.BLOCKED_INGRESS, target_called=False, layer_results=layers
+        )
     )
     assert rec.blocked_by == stage
 
@@ -803,7 +808,8 @@ def test_shadow_full_e2e_requires_target_called_and_shared_response_and_manifest
         _variant("X1"),
         _variant("X2"),
         EgressVariantRecord(
-            response_hash=canonical_hash({"r": "other"}), manifest_id="M1", variant="X3", verdict="block"
+            response_hash=canonical_hash({"r": "other"}), manifest_id="M1", variant="X3", verdict="block",
+            egress_action="blocked",
         ),
     )
     with pytest.raises(ValidationError):
@@ -813,7 +819,8 @@ def test_shadow_full_e2e_requires_target_called_and_shared_response_and_manifest
         _variant("X1"),
         _variant("X2"),
         EgressVariantRecord(
-            response_hash=canonical_hash({"r": "resp"}), manifest_id="M2", variant="X3", verdict="block"
+            response_hash=canonical_hash({"r": "resp"}), manifest_id="M2", variant="X3", verdict="block",
+            egress_action="blocked",
         ),
     )
     with pytest.raises(ValidationError):
@@ -1017,3 +1024,116 @@ def test_contracts_modes_module_is_pure_stdlib_and_matches_spec():
         contracts.resolve_derivation_mode("unknown")
     imports = _imported_top_levels(CONTRACTS_DIR / "modes.py")
     assert imports <= (set(sys.stdlib_module_names) | {"__future__"})
+
+
+# Step 4 (Part A2): oracle_result vs outcome, ingress layer evidence, EgressVariantRecord (§3.2)
+
+
+def test_success_requires_true_oracle_result_when_recorded():
+    assert RequestLogRecord(**_request_kwargs(outcome=Outcome.SUCCESS, oracle_result=True)).oracle_result is True
+    assert RequestLogRecord(**_request_kwargs(outcome=Outcome.SUCCESS, oracle_result=None)).oracle_result is None
+    with pytest.raises(ValidationError, match="Success requires oracle_result"):
+        RequestLogRecord(**_request_kwargs(outcome=Outcome.SUCCESS, oracle_result=False))
+
+
+def test_admitted_refused_requires_false_oracle_result_when_recorded():
+    rec = RequestLogRecord(**_request_kwargs(outcome=Outcome.ADMITTED_REFUSED, oracle_result=False))
+    assert rec.oracle_result is False
+    with pytest.raises(ValidationError, match="Admitted-refused requires oracle_result"):
+        RequestLogRecord(**_request_kwargs(outcome=Outcome.ADMITTED_REFUSED, oracle_result=True))
+
+
+@pytest.mark.parametrize("action", ["masked", "blocked"])
+def test_egress_saved_requires_false_oracle_result_when_recorded(action):
+    extra = {"blocked_by": "L4"} if action == "blocked" else {}
+    base = _request_kwargs(
+        outcome=Outcome.EGRESS_SAVED, egress_variant="X2", egress_action=action, target_called=True, **extra
+    )
+    assert RequestLogRecord(**{**base, "oracle_result": False}).oracle_result is False
+    with pytest.raises(ValidationError, match="Egress-saved requires oracle_result"):
+        RequestLogRecord(**{**base, "oracle_result": True})
+
+
+@pytest.mark.parametrize("oracle", [True, False, None])
+def test_blocked_ingress_and_error_do_not_constrain_oracle_result(oracle):
+    # A blocked or failed trial has no client-visible content; any recorded value is the harness's own label.
+    a = RequestLogRecord(**_request_kwargs(outcome=Outcome.ERROR, blocked_by="timeout", oracle_result=oracle))
+    b = RequestLogRecord(
+        **_request_kwargs(
+            outcome=Outcome.BLOCKED_INGRESS, blocked_by="body_cap", target_called=False, oracle_result=oracle
+        )
+    )
+    assert a.oracle_result is b.oracle_result is oracle
+
+
+@pytest.mark.parametrize("layer", ["L1", "L2", "L3"])
+def test_blocked_ingress_layer_requires_matching_block_evidence(layer):
+    ok = RequestLogRecord(
+        **_request_kwargs(
+            outcome=Outcome.BLOCKED_INGRESS, blocked_by=layer, target_called=False,
+            layer_results=(_layer("L1"), _layer(layer, "block")) if layer != "L1" else (_layer("L1", "block"),),
+        )
+    )
+    assert ok.blocked_by == layer
+    others = [name for name in ("L1", "L2", "L3") if name != layer]
+    contradictions = [
+        (),  # no evidence at all
+        (_layer(layer, "allow"),),  # the named layer allowed
+        (_layer(layer, "timeout"),),  # the named layer timed out (that is an Error, not a block)
+        (_layer(layer, "error"),),
+        tuple(_layer(name, "block") for name in others),  # a different layer blocked
+        (_layer("L4", "block"),),
+    ]
+    for layers in contradictions:
+        with pytest.raises(ValidationError, match="requires a L[123] LayerResult"):
+            RequestLogRecord(
+                **_request_kwargs(
+                    outcome=Outcome.BLOCKED_INGRESS, blocked_by=layer, target_called=False, layer_results=layers
+                )
+            )
+
+
+@pytest.mark.parametrize("cap", ["body_cap", "schema_validation", "decoded_cap", "window_cap"])
+def test_blocked_ingress_input_caps_need_no_layer_evidence(cap):
+    rec = RequestLogRecord(
+        **_request_kwargs(outcome=Outcome.BLOCKED_INGRESS, blocked_by=cap, target_called=False, layer_results=())
+    )
+    assert rec.layer_results == ()
+
+
+def test_blocked_ingress_evidence_matches_any_view():
+    decoded_block = LayerResult(**_valid_kwargs(layer="L2", view="decoded_view", verdict="block"))
+    rec = RequestLogRecord(
+        **_request_kwargs(
+            outcome=Outcome.BLOCKED_INGRESS, blocked_by="L2", target_called=False,
+            layer_results=(_layer("L1"), LayerResult(**_valid_kwargs(layer="L2", verdict="allow")), decoded_block),
+        )
+    )
+    assert rec.blocked_by == "L2"
+
+
+@pytest.mark.parametrize("action", ["none", "masked"])
+@pytest.mark.parametrize("variant", ["X1", "X2", "X3"])
+def test_egress_variant_block_verdict_requires_blocked_action(variant, action):
+    with pytest.raises(ValidationError, match="verdict='block' requires egress_action='blocked'"):
+        EgressVariantRecord(
+            response_hash="a" * 64, manifest_id="M1", variant=variant, verdict="block", egress_action=action
+        )
+    ok = EgressVariantRecord(
+        response_hash="a" * 64, manifest_id="M1", variant=variant, verdict="block", egress_action="blocked"
+    )
+    assert ok.egress_action == "blocked"
+
+
+@pytest.mark.parametrize(
+    ("verdict", "action"),
+    [
+        ("block", "blocked"), ("block", "none"), ("block", "masked"),
+        ("timeout", "none"), ("error", "none"), ("allow", "masked"), ("allow", "blocked"),
+    ],
+)
+def test_x0_runs_no_scan_so_only_allow_none_is_valid(verdict, action):
+    with pytest.raises(ValidationError, match="X0 performs no egress scan"):
+        EgressVariantRecord(response_hash="a" * 64, manifest_id="M1", variant="X0", verdict=verdict, egress_action=action)
+    ok = EgressVariantRecord(response_hash="a" * 64, manifest_id="M1", variant="X0", verdict="allow")
+    assert (ok.verdict, ok.egress_action) == ("allow", "none")
