@@ -113,3 +113,90 @@ def test_repository_is_ps5_clean():
         cwd=REPO_ROOT,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("char", ["\x00", "\x07", "\x08", "\t", "\x0b", "\x0c", "\x1f", "\x7f"])
+def test_ascii_control_characters_banned(char):
+    assert ps5_lint.is_banned(char)
+    hits = ps5_lint.scan_text(f"abc{char}def", Path("doc.md"))
+    assert len(hits) == 1
+    assert (hits[0].line, hits[0].column, hits[0].char) == (1, 4, char)
+    assert f"U+{ord(char):04X}" in hits[0].format()
+
+
+@pytest.mark.parametrize("char", ["\n", "\r"])
+def test_newline_and_carriage_return_allowed(char):
+    assert not ps5_lint.is_banned(char)
+
+
+def test_crlf_file_passes_cleanly(tmp_path):
+    (tmp_path / "win.txt").write_bytes(b"line1\r\nline2\r\n")
+    assert ps5_lint.main(["--root", str(tmp_path)]) == 0
+
+
+@pytest.mark.parametrize("char", ["\x07", "\x08", "\x00", "\t", "\x7f"])
+def test_main_fails_on_control_characters_in_text_file(tmp_path, char):
+    (tmp_path / "dirty.md").write_bytes(f"ok{char}bad\n".encode("utf-8"))
+    assert ps5_lint.main(["--root", str(tmp_path)]) == 1
+
+
+# Step 3.6: Unicode Cf format characters (BOM, zero-width, bidi) and non-UTF-8 files
+
+
+@pytest.mark.parametrize(
+    "char",
+    [
+        "\ufeff",  # UTF-8 BOM / zero width no-break space
+        "\u200b",  # zero width space
+        "\u200c",  # zero width non-joiner
+        "\u200d",  # zero width joiner
+        "\u2060",  # word joiner
+        "\u00ad",  # soft hyphen
+        "\u200e",  # left-to-right mark
+        "\u200f",  # right-to-left mark
+        "\u202a",  # left-to-right embedding
+        "\u202e",  # right-to-left override
+        "\u2066",  # left-to-right isolate
+        "\u2067",  # right-to-left isolate
+        "\u2069",  # pop directional isolate
+    ],
+)
+def test_unicode_format_cf_characters_banned(char):
+    assert ps5_lint.is_banned(char)
+    hits = ps5_lint.scan_text(f"a{char}b", Path("file.md"))
+    assert len(hits) == 1
+    assert (hits[0].line, hits[0].column, hits[0].char) == (1, 2, char)
+    assert f"U+{ord(char):04X}" in hits[0].format()
+
+
+def test_utf8_bom_at_start_of_file_fails_lint(tmp_path):
+    (tmp_path / "bom.md").write_bytes("\ufeff# Heading\n".encode("utf-8"))
+    hits = ps5_lint.lint([tmp_path])
+    assert len(hits) == 1
+    assert (hits[0].line, hits[0].column, hits[0].char) == (1, 1, "\ufeff")
+    assert ps5_lint.main(["--root", str(tmp_path)]) == 1
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16-le", "utf-16-be"])
+def test_utf16_markdown_file_with_em_dash_fails_lint(tmp_path, encoding):
+    md = tmp_path / f"doc_{encoding}.md"
+    md.write_bytes(f"# Notes\nbad {EM_DASH} dash\n".encode(encoding))
+    hits = ps5_lint.scan_file(md)
+    assert len(hits) >= 1
+    assert ps5_lint.main(["--root", str(tmp_path)]) == 1
+
+
+def test_non_utf8_text_file_reports_violation_while_binary_allowlist_passes(tmp_path):
+    txt = tmp_path / "latin1.txt"
+    txt.write_bytes(b"caf\xe9 invalid utf8\n")
+    hits = ps5_lint.lint([tmp_path])
+    assert len(hits) == 1
+    assert "non-UTF-8" in hits[0].format()
+    assert ps5_lint.main(["--root", str(tmp_path)]) == 1
+
+    # Explicit binary suffixes are still skipped cleanly.
+    txt.unlink()
+    (tmp_path / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe")
+    (tmp_path / "model.onnx").write_bytes(b"\xff\xfe\x80\x00")
+    assert ps5_lint.lint([tmp_path]) == []
+    assert ps5_lint.main(["--root", str(tmp_path)]) == 0

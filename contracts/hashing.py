@@ -2,7 +2,7 @@
 
 Python's built-in `hash()` is salted per process and must never be used for
 keys that have to repeat across runs. This module serializes the payload to
-canonical JSON and hashes the UTF-8 bytes with SHA-256.
+canonical JSON and hashes the UTF-8 bytes (lone surrogates kept via surrogatepass; astral characters never collide with surrogate pairs) with SHA-256.
 """
 
 from __future__ import annotations
@@ -48,11 +48,11 @@ def canonical_json(payload: Any) -> str:
         _normalize(payload),
         sort_keys=True,
         separators=(",", ":"),
-        ensure_ascii=True,
+        ensure_ascii=False,
         allow_nan=False,
     )
 
 
 def canonical_hash(payload: Any) -> str:
     """Return the lowercase 64-character SHA-256 hex digest of the canonical JSON."""
-    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical_json(payload).encode("utf-8", errors="surrogatepass")).hexdigest()

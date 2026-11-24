@@ -21,3 +21,4 @@ chroma_db/
 .ipynb_checkpoints/
 # Experiment runs and trial logs; may contain harmful completions (§2.7, §3.8). Never commit.
 results/
+data/logs/

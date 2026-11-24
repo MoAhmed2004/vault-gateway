@@ -144,13 +144,14 @@ def test_canonical_hash_matches_sha256_of_compact_sorted_json():
     assert canonical_hash({"b": [1, 2], "a": 1}) == expected
 
 
-def test_canonical_hash_unicode_is_deterministic_and_ascii_escaped():
+def test_canonical_hash_unicode_is_deterministic_and_utf8():
     from contracts.hashing import canonical_json
 
     payload = {"text": "caf\u00e9 \u4e2d\u6587 \u00a72.7"}
     assert canonical_hash(payload) == canonical_hash(dict(payload))
-    assert canonical_json(payload).isascii()
-    assert "\\u00e9" in canonical_json(payload)
+    assert "caf\u00e9" in canonical_json(payload)
+    expected = hashlib.sha256('{"text":"caf\u00e9"}'.encode("utf-8")).hexdigest()
+    assert canonical_hash({"text": "caf\u00e9"}) == expected
     assert canonical_hash({"text": "cafe"}) != canonical_hash({"text": "caf\u00e9"})
 
 
@@ -169,13 +170,13 @@ def test_canonical_hash_distinguishes_different_surrogates():
     assert canonical_hash({"t": "\ud800"}) != canonical_hash({"t": "\ud801"})
 
 
-def test_canonical_json_uses_ascii_and_disallows_nan():
+def test_canonical_json_uses_utf8_and_disallows_nan():
     import inspect
 
     from contracts import hashing
 
     src = inspect.getsource(hashing.canonical_json)
-    assert "ensure_ascii=True" in src
+    assert "ensure_ascii=False" in src
     assert "allow_nan=False" in src
 
 
@@ -255,6 +256,15 @@ def _layer(layer="L1", verdict="allow"):
     return LayerResult(**_valid_kwargs(layer=layer, verdict=verdict))
 
 
+def _variant(name="X0", verdict="allow", **kw):
+    return EgressVariantRecord(
+        response_hash=canonical_hash({"r": "resp"}), manifest_id="M1", variant=name, verdict=verdict, **kw
+    )
+
+
+ALL_VARIANTS = tuple(_variant(n) for n in ("X0", "X1", "X2", "X3"))
+
+
 def _request_kwargs(**overrides):
     base = {
         "timestamp_utc": "2026-11-23T18:00:00Z",
@@ -278,10 +288,10 @@ def _shadow_kwargs(**overrides):
         "total_latency_ms": 120.5,
         "target_called": True,
         "cache_hit": False,
-        "egress_variants": (
-            EgressVariantRecord(variant="X0", verdict="allow", oracle_result=True),
-            EgressVariantRecord(variant="X3", verdict="block", oracle_result=False),
-        ),
+        "egress_variants": ALL_VARIANTS,
+        "layer_version": "l-1",
+        "bundle_version": "b-1",
+        "chroma_version": "c-1",
     }
     base.update(overrides)
     return base
@@ -292,7 +302,8 @@ def test_request_log_record_field_names_cover_rt_v6():
         "trial_id", "objective_id", "tier", "config", "seed", "query_index",
         "operator_chain", "layer_results", "target_called", "oracle_result", "judge_score",
         "outcome", "timestamp_utc", "gateway_mode", "prompt_hash", "total_latency_ms",
-        "reasoning_findings",
+        "reasoning_findings", "blocked_by", "egress_variant", "egress_action",
+        "timeout_policy", "cache_hit", "model_id",
     }
     assert set(RequestLogRecord.model_fields) == required
 
@@ -303,6 +314,7 @@ def test_request_log_record_production_defaults_are_none():
                  "operator_chain", "oracle_result", "judge_score"):
         assert getattr(rec, name) is None
     assert rec.reasoning_findings == ()
+    assert rec.egress_action == "none"
 
 
 def test_request_log_record_full_eval_record():
@@ -358,7 +370,7 @@ def test_shadow_record_field_names_cover_ip4():
 
 def test_shadow_record_full_e2e_with_egress_variants():
     rec = ShadowRecord(**_shadow_kwargs())
-    assert [v.variant for v in rec.egress_variants] == ["X0", "X3"]
+    assert [v.variant for v in rec.egress_variants] == ["X0", "X1", "X2", "X3"]
     assert len(rec.layer_results) == 3
     assert HEX64.match(canonical_hash(rec))
 
@@ -377,14 +389,11 @@ def test_shadow_record_ingress_only_rejects_groq_call_or_egress():
 
 
 def test_shadow_record_rejects_duplicate_variant_and_bad_variant():
-    dup = (
-        EgressVariantRecord(variant="X1", verdict="allow"),
-        EgressVariantRecord(variant="X1", verdict="block"),
-    )
+    dup = (_variant("X1", "allow"), _variant("X1", "block"))
     with pytest.raises(ValidationError):
         ShadowRecord(**_shadow_kwargs(egress_variants=dup))
     with pytest.raises(ValidationError):
-        EgressVariantRecord(variant="X4", verdict="allow")
+        _variant("X4", "allow")
 
 
 def test_shadow_record_frozen_extra_and_finite():
@@ -493,13 +502,22 @@ def test_telemetry_sink_signatures_use_typed_records():
 
 def test_contracts_reexports():
     assert set(contracts.__all__) == {
+        "ALL_GATEWAY_MODES",
+        "DETERMINISTIC_MODES",
+        "DerivationKind",
+        "EgressAction",
         "EgressVariantRecord",
+        "GatewayMode",
         "LayerResult",
         "Outcome",
+        "RANDOM_MODES",
         "RequestLogRecord",
+        "SYNCED_FOLDER_MARKERS",
         "ShadowRecord",
         "TelemetrySink",
         "canonical_hash",
+        "resolve_derivation_mode",
+        "synced_folder_component",
     }
 
 
@@ -533,3 +551,469 @@ def test_contracts_imports_only_stdlib_pydantic_or_self():
     for path in sorted(CONTRACTS_DIR.rglob("*.py")):
         extra = _imported_top_levels(path) - allowed
         assert not extra, f"{path.name} imports non-neutral modules: {sorted(extra)}"
+
+
+# Step 3: Findings 1 and 2
+
+SURROGATE_PAIR = "\ud83d\ude00"
+
+
+def test_canonical_hash_astral_does_not_collide_with_surrogate_pair():
+    assert canonical_hash("\U0001F600") != canonical_hash(SURROGATE_PAIR)
+    assert canonical_hash({"t": "\U0001F600"}) != canonical_hash({"t": SURROGATE_PAIR})
+
+
+def test_canonical_hash_lone_surrogate_scalar_succeeds():
+    assert HEX64.match(canonical_hash("\ud800"))
+    assert canonical_hash("\ud800") == canonical_hash("\ud800")
+
+
+def test_canonical_hash_astral_matches_utf8_digest():
+    expected = hashlib.sha256('"\U0001F600"'.encode("utf-8")).hexdigest()
+    assert canonical_hash("\U0001F600") == expected
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "ABC", "a" * 63, "a" * 65, "A" * 64, "g" * 64, " " + "a" * 63, "a" * 64 + "\n"]
+)
+def test_prompt_hash_must_be_64_lowercase_hex(bad):
+    with pytest.raises(ValidationError):
+        RequestLogRecord(**_request_kwargs(prompt_hash=bad))
+    with pytest.raises(ValidationError):
+        ShadowRecord(**_shadow_kwargs(prompt_hash=bad))
+
+
+def test_egress_variant_record_requires_valid_response_hash_and_manifest():
+    with pytest.raises(ValidationError):
+        EgressVariantRecord(response_hash="XYZ", manifest_id="M1", variant="X1", verdict="allow")
+    with pytest.raises(ValidationError):
+        EgressVariantRecord(response_hash="A" * 64, manifest_id="M1", variant="X1", verdict="allow")
+    with pytest.raises(ValidationError):
+        EgressVariantRecord(response_hash="a" * 64, manifest_id="", variant="X1", verdict="allow")
+    with pytest.raises(ValidationError):
+        EgressVariantRecord(response_hash="a" * 64, variant="X1", verdict="allow")
+    with pytest.raises(ValidationError):
+        EgressVariantRecord(manifest_id="M1", variant="X1", verdict="allow")
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["L1", "L2", "L3", "body_cap", "schema_validation", "decoded_cap", "window_cap"],
+)
+def test_request_log_blocked_by_accepts_all_ingress_and_prelayer_stages(stage):
+    rec = RequestLogRecord(
+        **_request_kwargs(blocked_by=stage, outcome=Outcome.BLOCKED_INGRESS, target_called=False)
+    )
+    assert rec.blocked_by == stage
+
+
+def test_request_log_blocked_by_uses_canonical_l4_and_rejects_duplicate_label():
+    rec = RequestLogRecord(
+        **_request_kwargs(
+            outcome=Outcome.EGRESS_SAVED,
+            egress_variant="X1",
+            egress_action="blocked",
+            blocked_by="L4",
+            target_called=True,
+        )
+    )
+    assert rec.blocked_by == "L4"
+    with pytest.raises(ValidationError):
+        RequestLogRecord(
+            **_request_kwargs(
+                outcome=Outcome.EGRESS_SAVED,
+                egress_variant="X1",
+                egress_action="blocked",
+                blocked_by="L4_egress",
+                target_called=True,
+            )
+        )
+
+
+def test_request_log_blocked_by_rejects_unknown_stage():
+    with pytest.raises(ValidationError):
+        RequestLogRecord(**_request_kwargs(blocked_by="L9", outcome=Outcome.BLOCKED_INGRESS, target_called=False))
+
+
+def test_request_log_context_fields_validated():
+    rec = RequestLogRecord(
+        **_request_kwargs(egress_variant="X2", timeout_policy="P-closed", cache_hit=True, model_id="m")
+    )
+    assert (rec.egress_variant, rec.timeout_policy, rec.cache_hit, rec.model_id) == ("X2", "P-closed", True, "m")
+    with pytest.raises(ValidationError):
+        RequestLogRecord(**_request_kwargs(egress_variant="X9"))
+    with pytest.raises(ValidationError):
+        RequestLogRecord(**_request_kwargs(timeout_policy="P-weird"))
+
+
+def test_request_log_config_disallows_inf_nan():
+    assert RequestLogRecord.model_config["allow_inf_nan"] is False
+
+
+@pytest.mark.parametrize("variant", ["X1", "X2", "X3"])
+def test_egress_saved_valid_with_blocked_by(variant):
+    rec = RequestLogRecord(
+        **_request_kwargs(
+            outcome=Outcome.EGRESS_SAVED,
+            egress_variant=variant,
+            egress_action="blocked",
+            blocked_by="L4",
+            target_called=True,
+        )
+    )
+    assert rec.outcome == Outcome.EGRESS_SAVED
+    assert rec.egress_action == "blocked"
+
+
+def test_egress_saved_valid_with_l4_block_layer_result():
+    rec = RequestLogRecord(
+        **_request_kwargs(
+            outcome=Outcome.EGRESS_SAVED,
+            egress_variant="X1",
+            egress_action="blocked",
+            target_called=True,
+            layer_results=(_layer("L1"), _layer("L4", "block")),
+        )
+    )
+    assert rec.blocked_by is None
+    assert rec.egress_action == "blocked"
+
+
+@pytest.mark.parametrize("variant", [None, "X0"])
+def test_egress_saved_rejects_missing_or_x0_variant(variant):
+    with pytest.raises(ValidationError):
+        RequestLogRecord(
+            **_request_kwargs(
+                outcome=Outcome.EGRESS_SAVED,
+                egress_variant=variant,
+                egress_action="blocked",
+                blocked_by="L4",
+                target_called=True,
+            )
+        )
+
+
+def test_egress_saved_rejects_missing_blocking_evidence():
+    with pytest.raises(ValidationError):
+        RequestLogRecord(**_request_kwargs(outcome=Outcome.EGRESS_SAVED, egress_variant="X2", target_called=True))
+    with pytest.raises(ValidationError):
+        RequestLogRecord(
+            **_request_kwargs(
+                outcome=Outcome.EGRESS_SAVED,
+                egress_variant="X2",
+                egress_action="blocked",
+                blocked_by="L3",
+                target_called=True,
+            )
+        )
+    with pytest.raises(ValidationError):
+        RequestLogRecord(
+            **_request_kwargs(
+                outcome=Outcome.EGRESS_SAVED,
+                egress_variant="X2",
+                egress_action="blocked",
+                target_called=True,
+                layer_results=(_layer("L4", "allow"),),
+            )
+        )
+    with pytest.raises(ValidationError):
+        RequestLogRecord(
+            **_request_kwargs(
+                outcome=Outcome.EGRESS_SAVED,
+                egress_variant="X2",
+                egress_action="blocked",
+                blocked_by="L1",
+                target_called=True,
+                layer_results=(_layer("L4", "block"),),
+            )
+        )
+
+
+# Step 3.5: Cross-field consistency and shared synced-folder paths (Findings 6 and 8)
+
+
+@pytest.mark.parametrize("outcome", [Outcome.SUCCESS, Outcome.ADMITTED_REFUSED])
+def test_success_and_admitted_refused_require_no_block_and_target_called(outcome):
+    rec = RequestLogRecord(**_request_kwargs(outcome=outcome, blocked_by=None, target_called=True))
+    assert rec.outcome == outcome
+    with pytest.raises(ValidationError):
+        RequestLogRecord(**_request_kwargs(outcome=outcome, blocked_by="L1", target_called=True))
+    with pytest.raises(ValidationError):
+        RequestLogRecord(**_request_kwargs(outcome=outcome, blocked_by="L4", target_called=True))
+    with pytest.raises(ValidationError):
+        RequestLogRecord(**_request_kwargs(outcome=outcome, blocked_by=None, target_called=False))
+
+
+def test_blocked_ingress_rejects_contradictory_states():
+    with pytest.raises(ValidationError):
+        RequestLogRecord(**_request_kwargs(outcome=Outcome.BLOCKED_INGRESS, blocked_by=None, target_called=False))
+    with pytest.raises(ValidationError):
+        RequestLogRecord(**_request_kwargs(outcome=Outcome.BLOCKED_INGRESS, blocked_by="L4", target_called=False))
+    with pytest.raises(ValidationError):
+        RequestLogRecord(**_request_kwargs(outcome=Outcome.BLOCKED_INGRESS, blocked_by="L1", target_called=True))
+
+
+def test_egress_saved_rejects_target_not_called():
+    with pytest.raises(ValidationError):
+        RequestLogRecord(
+            **_request_kwargs(
+                outcome=Outcome.EGRESS_SAVED,
+                egress_variant="X2",
+                egress_action="blocked",
+                blocked_by="L4",
+                target_called=False,
+            )
+        )
+
+
+def test_error_outcome_allows_either_target_called_state():
+    a = RequestLogRecord(**_request_kwargs(outcome=Outcome.ERROR, blocked_by="p_closed", target_called=False))
+    b = RequestLogRecord(**_request_kwargs(outcome=Outcome.ERROR, blocked_by="timeout", target_called=True))
+    assert (a.target_called, b.target_called) == (False, True)
+
+
+@pytest.mark.parametrize("field", ["layer_version", "bundle_version", "chroma_version"])
+def test_shadow_record_versions_required_and_non_empty(field):
+    kwargs = _shadow_kwargs()
+    del kwargs[field]
+    with pytest.raises(ValidationError):
+        ShadowRecord(**kwargs)
+    with pytest.raises(ValidationError):
+        ShadowRecord(**_shadow_kwargs(**{field: ""}))
+    with pytest.raises(ValidationError):
+        ShadowRecord(**_shadow_kwargs(**{field: None}))
+
+
+@pytest.mark.parametrize("names", [(), ("X0",), ("X0", "X1", "X2"), ("X1", "X2", "X3")])
+def test_shadow_full_e2e_rejects_partial_variant_sets(names):
+    with pytest.raises(ValidationError):
+        ShadowRecord(**_shadow_kwargs(egress_variants=tuple(_variant(n) for n in names)))
+
+
+def test_shadow_full_e2e_accepts_all_four_in_any_order():
+    rec = ShadowRecord(**_shadow_kwargs(egress_variants=tuple(_variant(n) for n in ("X3", "X1", "X0", "X2"))))
+    assert len(rec.egress_variants) == 4
+
+
+def test_shadow_full_e2e_requires_target_called_and_shared_response_and_manifest():
+    with pytest.raises(ValidationError):
+        ShadowRecord(**_shadow_kwargs(target_called=False))
+    diff_hash = (
+        _variant("X0"),
+        _variant("X1"),
+        _variant("X2"),
+        EgressVariantRecord(
+            response_hash=canonical_hash({"r": "other"}), manifest_id="M1", variant="X3", verdict="block"
+        ),
+    )
+    with pytest.raises(ValidationError):
+        ShadowRecord(**_shadow_kwargs(egress_variants=diff_hash))
+    diff_manifest = (
+        _variant("X0"),
+        _variant("X1"),
+        _variant("X2"),
+        EgressVariantRecord(
+            response_hash=canonical_hash({"r": "resp"}), manifest_id="M2", variant="X3", verdict="block"
+        ),
+    )
+    with pytest.raises(ValidationError):
+        ShadowRecord(**_shadow_kwargs(egress_variants=diff_manifest))
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        Path("C:/Users/x/OneDrive/vault.db"),
+        Path("C:/Users/x/OneDrive - Org/vault.db"),
+        Path("D:/Dropbox/vault.db"),
+        Path("D:/Google Drive/vault.db"),
+        Path("D:/GoogleDrive/vault.db"),
+        Path("/Users/x/iCloudDrive/vault.db"),
+        Path("/Users/x/Library/Mobile Documents/com~apple~CloudDocs/vault.db"),
+        Path("C:/Users/x/Box/vault.db"),
+        Path("C:/Users/x/Box Sync/vault.db"),
+    ],
+)
+def test_synced_folder_component_detects_cloud_folders(path):
+    assert contracts.synced_folder_component(path) is not None
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        Path("C:/Users/x/sandbox/vault.db"),
+        Path("C:/Users/x/toolbox/vault.db"),
+        Path("C:/Users/x/inbox/vault.db"),
+        Path("C:/projects/vault-gateway/data/logs/vault.db"),
+    ],
+)
+def test_synced_folder_component_avoids_box_false_positives(path):
+    assert contracts.synced_folder_component(path) is None
+
+
+# Step 3.6: EgressAction masking, strict §3.2 outcome mapping, and contracts/modes.py
+
+
+@pytest.mark.parametrize("variant", ["X1", "X2", "X3"])
+def test_egress_saved_accepts_masked_action(variant):
+    rec = RequestLogRecord(
+        **_request_kwargs(
+            outcome=Outcome.EGRESS_SAVED,
+            egress_variant=variant,
+            egress_action="masked",
+            blocked_by=None,
+            target_called=True,
+            layer_results=(_layer("L1"), _layer("L4", "allow")),
+        )
+    )
+    assert rec.outcome == Outcome.EGRESS_SAVED
+    assert rec.egress_action == "masked"
+    assert rec.blocked_by is None
+
+
+def test_egress_saved_masked_rejects_block_metadata_and_none_action_rejected():
+    with pytest.raises(ValidationError):
+        RequestLogRecord(
+            **_request_kwargs(
+                outcome=Outcome.EGRESS_SAVED,
+                egress_variant="X1",
+                egress_action="masked",
+                blocked_by="L4",
+                target_called=True,
+            )
+        )
+    with pytest.raises(ValidationError):
+        RequestLogRecord(
+            **_request_kwargs(
+                outcome=Outcome.EGRESS_SAVED,
+                egress_variant="X1",
+                egress_action="masked",
+                target_called=True,
+                layer_results=(_layer("L4", "block"),),
+            )
+        )
+    with pytest.raises(ValidationError):
+        RequestLogRecord(
+            **_request_kwargs(
+                outcome=Outcome.EGRESS_SAVED,
+                egress_variant="X1",
+                egress_action="none",
+                blocked_by="L4",
+                target_called=True,
+            )
+        )
+
+
+def test_egress_variant_record_egress_action_consistency():
+    v_none = _variant("X0", "allow")
+    assert v_none.egress_action == "none"
+    v_masked = _variant("X1", "allow", egress_action="masked")
+    assert v_masked.egress_action == "masked"
+    v_blocked = _variant("X2", "block", egress_action="blocked")
+    assert v_blocked.egress_action == "blocked"
+    with pytest.raises(ValidationError):
+        _variant("X0", "allow", egress_action="masked")
+    with pytest.raises(ValidationError):
+        _variant("X0", "block", egress_action="blocked")
+    with pytest.raises(ValidationError):
+        _variant("X1", "allow", egress_action="blocked")
+    with pytest.raises(ValidationError):
+        _variant("X1", "block", egress_action="masked")
+
+
+def test_benign_overmasking_allowed_on_admitted_refused_but_blocked_action_rejected():
+    rec = RequestLogRecord(
+        **_request_kwargs(
+            outcome=Outcome.ADMITTED_REFUSED,
+            egress_variant="X1",
+            egress_action="masked",
+            blocked_by=None,
+            target_called=True,
+        )
+    )
+    assert rec.egress_action == "masked"
+    with pytest.raises(ValidationError):
+        RequestLogRecord(
+            **_request_kwargs(
+                outcome=Outcome.ADMITTED_REFUSED,
+                egress_variant="X1",
+                egress_action="blocked",
+                blocked_by=None,
+                target_called=True,
+            )
+        )
+    with pytest.raises(ValidationError):
+        RequestLogRecord(
+            **_request_kwargs(
+                outcome=Outcome.ADMITTED_REFUSED,
+                egress_variant="X0",
+                egress_action="masked",
+                blocked_by=None,
+                target_called=True,
+            )
+        )
+
+
+@pytest.mark.parametrize("fault", ["load_shed", "p_closed", "timeout", "upstream_error", "internal_error"])
+def test_operational_faults_rejected_under_blocked_ingress_and_accepted_under_error(fault):
+    with pytest.raises(ValidationError):
+        RequestLogRecord(**_request_kwargs(outcome=Outcome.BLOCKED_INGRESS, blocked_by=fault, target_called=False))
+    rec = RequestLogRecord(**_request_kwargs(outcome=Outcome.ERROR, blocked_by=fault, target_called=False))
+    assert rec.outcome == Outcome.ERROR and rec.blocked_by == fault
+
+
+@pytest.mark.parametrize(
+    "security_or_cap",
+    ["L1", "L2", "L3", "L4", "body_cap", "schema_validation", "decoded_cap", "window_cap", None],
+)
+def test_layer_blocks_and_caps_rejected_under_error_outcome(security_or_cap):
+    for tc in (False, True):
+        with pytest.raises(ValidationError):
+            RequestLogRecord(**_request_kwargs(outcome=Outcome.ERROR, blocked_by=security_or_cap, target_called=tc))
+
+
+def test_p_closed_rejects_target_called_true():
+    with pytest.raises(ValidationError):
+        RequestLogRecord(**_request_kwargs(outcome=Outcome.ERROR, blocked_by="p_closed", target_called=True))
+
+
+@pytest.mark.parametrize("routing_miss", ["not_found", "method_not_allowed"])
+@pytest.mark.parametrize("outcome", list(Outcome))
+def test_routing_misses_removed_from_blocked_by(routing_miss, outcome):
+    for tc in (False, True):
+        with pytest.raises(ValidationError):
+            RequestLogRecord(**_request_kwargs(outcome=outcome, blocked_by=routing_miss, target_called=tc))
+
+
+def test_cache_hit_with_target_called_true_is_valid_across_admitted_outcomes():
+    for outcome in (Outcome.SUCCESS, Outcome.ADMITTED_REFUSED):
+        rec = RequestLogRecord(**_request_kwargs(outcome=outcome, target_called=True, cache_hit=True))
+        assert rec.target_called is True and rec.cache_hit is True
+    saved = RequestLogRecord(
+        **_request_kwargs(
+            outcome=Outcome.EGRESS_SAVED,
+            egress_variant="X2",
+            egress_action="masked",
+            target_called=True,
+            cache_hit=True,
+        )
+    )
+    assert saved.target_called is True and saved.cache_hit is True
+    shadow = ShadowRecord(**_shadow_kwargs(target_called=True, cache_hit=True))
+    assert shadow.target_called is True and shadow.cache_hit is True
+
+
+def test_contracts_modes_module_is_pure_stdlib_and_matches_spec():
+    assert contracts.DETERMINISTIC_MODES == ("eval", "shadow_ingress_only", "shadow_full_e2e")
+    assert contracts.RANDOM_MODES == ("production", "demo")
+    assert contracts.ALL_GATEWAY_MODES == (
+        "eval", "shadow_ingress_only", "shadow_full_e2e", "production", "demo"
+    )
+    for m in contracts.DETERMINISTIC_MODES:
+        assert contracts.resolve_derivation_mode(m) == "deterministic"
+    for m in contracts.RANDOM_MODES:
+        assert contracts.resolve_derivation_mode(m) == "random"
+    with pytest.raises(ValueError):
+        contracts.resolve_derivation_mode("unknown")
+    imports = _imported_top_levels(CONTRACTS_DIR / "modes.py")
+    assert imports <= (set(sys.stdlib_module_names) | {"__future__"})

@@ -1,20 +1,25 @@
-"""PS-5 linter: fail on emojis, em dashes, and en dashes in project text files.
+"""PS-5 linter: fail on emojis, em/en dashes, control/format chars, and non-UTF-8 text files.
 
 Usage:
     python scripts/ps5_lint.py [--root DIR] [PATH ...]
 
-Exit code 0 when clean, 1 when any banned character is found. The banned
-characters are written as escapes in this file so the linter passes on itself.
+Exit code 0 when clean, 1 when any banned character or non-UTF-8 text file is
+found. The banned characters are written as escapes in this file so the linter
+passes on itself.
 
 Banned: emojis and pictographs (PS-5 pattern 3), em dashes (PS-5 pattern 16),
-and en dashes ([Project Decision, extends PS-5]: spec pattern 16 names em dashes
-only; this project bans en dashes as well). Plain utilitarian status glyphs
-(check mark, ballot cross, black circle, black square, box-drawing, arrows) are
-allowed for the W15 SOC console.
+en dashes ([Project Decision, extends PS-5]: spec pattern 16 names em dashes
+only; this project bans en dashes as well), ASCII control characters
+(`ord(ch) < 0x20` except `\n` and `\r`, plus `0x7F` DEL), Unicode format
+characters (`unicodedata.category(ch) == "Cf"`, including BOM `U+FEFF`,
+zero-width spaces `U+200B`, and bidirectional controls `U+202E`, `U+2066`,
+etc.), and any file outside `BINARY_SUFFIXES` that is not valid UTF-8. Plain
+utilitarian status glyphs (check mark, ballot cross, black circle, black
+square, box-drawing, arrows) are allowed for the W15 SOC console.
 
 Skipped: dataset and cache directories, virtualenv, VCS, results, ChromaDB,
 `data/translations/` (hand-curated Arabic, French, Spanish text), binary and
-PDF files, and any file larger than 5 MiB.
+PDF files (`BINARY_SUFFIXES`), and any file larger than 5 MiB.
 
 TODO before W15: add text-level UI pattern checks for `linear-gradient`,
 `backdrop-filter`, `Inter`, `Space Grotesk`, `Instrument Serif`, and `lucide`.
@@ -88,7 +93,7 @@ MAX_FILE_BYTES = 5 * 1024 * 1024
 BINARY_SUFFIXES = frozenset(
     {
         ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".bmp",
-        ".onnx", ".pt", ".safetensors", ".ckpt", ".bin", ".npy", ".npz",
+        ".onnx", ".pt", ".safetensors", ".ckpt", ".bin", ".dat", ".npy", ".npz",
         ".db", ".sqlite", ".sqlite3", ".zip", ".gz", ".tar", ".whl",
         ".pyc", ".pyd", ".so", ".dll", ".exe", ".woff", ".woff2", ".ttf",
     }
@@ -101,25 +106,47 @@ class Hit:
     line: int
     column: int
     char: str
+    reason: str | None = None
 
     def format(self) -> str:
-        name = unicodedata.name(self.char, "UNKNOWN")
-        return f"{self.path}:{self.line}:{self.column}: U+{ord(self.char):04X} {name}"
+        if self.reason is not None:
+            return f"{self.path}:{self.line}:{self.column}: {self.reason}"
+        code = ord(self.char)
+        if code < 0x20 or code == 0x7F:
+            default_name = "CONTROL"
+        elif unicodedata.category(self.char) == "Cf":
+            default_name = "FORMAT"
+        else:
+            default_name = "UNKNOWN"
+        name = unicodedata.name(self.char, default_name)
+        return f"{self.path}:{self.line}:{self.column}: U+{code:04X} {name}"
 
 
 def is_banned(char: str) -> bool:
     if char in (EM_DASH, EN_DASH):
         return True
     code = ord(char)
+    if (code < 0x20 and char not in ("\n", "\r")) or code == 0x7F:
+        return True
+    if unicodedata.category(char) == "Cf":
+        return True
     return any(low <= code <= high for low, high in EMOJI_RANGES)
 
 
 def scan_text(text: str, path: Path) -> list[Hit]:
     hits: list[Hit] = []
-    for line_no, line in enumerate(text.splitlines(), start=1):
-        for col_no, char in enumerate(line, start=1):
-            if is_banned(char):
-                hits.append(Hit(path, line_no, col_no, char))
+    line_no = 1
+    col_no = 0
+    for char in text:
+        if char == "\n":
+            line_no += 1
+            col_no = 0
+            continue
+        if char == "\r":
+            continue
+        col_no += 1
+        if is_banned(char):
+            hits.append(Hit(path, line_no, col_no, char))
     return hits
 
 
@@ -129,12 +156,18 @@ def scan_file(path: Path) -> list[Hit]:
     if path.stat().st_size > MAX_FILE_BYTES:
         return []
     data = path.read_bytes()
-    if b"\x00" in data:
-        return []
     try:
         text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        return []
+    except UnicodeDecodeError as exc:
+        return [
+            Hit(
+                path,
+                1,
+                exc.start + 1,
+                "",
+                reason=f"non-UTF-8 file ({exc.reason} at byte {exc.start})",
+            )
+        ]
     return scan_text(text, path)
 
 
@@ -172,9 +205,9 @@ def main(argv: list[str] | None = None) -> int:
     for hit in hits:
         print(hit.format())
     if hits:
-        print(f"PS-5 lint: FAIL ({len(hits)} banned character(s))")
+        print(f"PS-5 lint: FAIL ({len(hits)} violation(s))")
         return 1
-    print("PS-5 lint: OK (0 banned characters)")
+    print("PS-5 lint: OK (0 violations)")
     return 0
 
 
