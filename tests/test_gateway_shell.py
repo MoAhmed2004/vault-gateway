@@ -272,6 +272,59 @@ def test_malformed_content_length_is_refused(headers):
     assert pulls == 0 and not inner.called and refusals == ["body_cap"] and _status(sent) == 503
 
 
+FIVE_THOUSAND_DIGITS = b"1" * 5000
+
+
+@pytest.mark.parametrize("value", [b"\xb2", b"1\xb2", "١٢".encode("utf-8"), FIVE_THOUSAND_DIGITS, b"0" * 21])
+def test_non_ascii_or_overlong_content_length_is_refused_at_the_middleware(value):
+    """F3: superscript digits and huge digit strings are malformed (body_cap), never a ValueError."""
+    inner, refusals, sent, pulls = drive(iter([b"x"]), [(b"content-length", value)])
+    assert pulls == 0 and not inner.called and refusals == ["body_cap"] and _status(sent) == 503
+
+
+def test_twenty_digit_content_length_is_still_parsed():
+    headers = [(b"content-length", b"0" * 19 + b"5")]
+    inner, refusals, sent, _ = drive(iter([b"abcde"]), headers)
+    assert inner.called and inner.body == b"abcde" and refusals == [] and _status(sent) == 200
+
+
+def asgi_post(app, headers: list[tuple[bytes, bytes]], body: bytes = b"") -> list[dict[str, Any]]:
+    """Send one raw ASGI POST /v1/chat through the full app (headers exactly as given), inside its lifespan."""
+    sent: list[dict[str, Any]] = []
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def receive():
+        return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST", "scheme": "http",
+        "path": "/v1/chat", "raw_path": b"/v1/chat", "root_path": "", "query_string": b"",
+        "headers": headers, "client": ("127.0.0.1", 50000), "server": ("gateway.test", 80),
+    }
+
+    async def go():
+        async with app.router.lifespan_context(app):
+            await app(scope, receive, send)
+
+    asyncio.run(go())
+    return sent
+
+
+@pytest.mark.parametrize("value", [b"\xb2", FIVE_THOUSAND_DIGITS], ids=["superscript-two", "5000-digits"])
+def test_malformed_content_length_through_the_app_logs_body_cap_not_internal_error(gateway, sink, value):
+    """F3: the full app answers with the uniform 503 and logs Blocked-ingress / body_cap."""
+    sent = asgi_post(gateway, [(b"content-type", b"application/json"), (b"content-length", value)], b'{"user_prompt":"hi"}')
+    start, body = sent
+    assert start["status"] == UNIFORM_REFUSAL_STATUS and start["headers"] == list(UNIFORM_REFUSAL_HEADERS)
+    assert body["body"] == UNIFORM_REFUSAL_BODY
+    assert [(r.outcome, r.blocked_by, r.prompt_hash) for r in sink.records] == [
+        (Outcome.BLOCKED_INGRESS, "body_cap", UNPARSED_PROMPT_HASH)
+    ]
+
+
 def test_client_disconnect_mid_body_sends_nothing():
     inner, refusals, sent, _ = drive(iter([b"a" * 100]))  # more_body=False on the only chunk: accepted
     assert inner.called
@@ -329,6 +382,9 @@ CAUSES: list[tuple[str, str, str, dict[str, Any], str | None]] = [
     ("openapi disabled", "GET", "/openapi.json", {}, None),
     ("method 405", "GET", "/v1/chat", {}, None),
     ("method 405 on probe", "PUT", "/healthz", {}, None),
+    ("trailing slash on chat", "POST", "/v1/chat/", {"json": {"user_prompt": "hi"}}, None),
+    ("trailing slash on probe", "GET", "/healthz/", {}, None),
+    ("double trailing slash", "POST", "/v1/chat//", {"json": {"user_prompt": "hi"}}, None),
     ("extra field", "POST", "/v1/chat", {"json": {"user_prompt": "hi", "extra": 1}}, "schema_validation"),
     ("stream true", "POST", "/v1/chat", {"json": {"user_prompt": "hi", "stream": True}}, "schema_validation"),
     ("stream string", "POST", "/v1/chat", {"json": {"user_prompt": "hi", "stream": "false"}}, "schema_validation"),
@@ -386,6 +442,18 @@ def test_refusals_leak_no_internal_detail(tmp_path, sink):
             assert leak not in text
 
 
+@pytest.mark.parametrize(
+    ("method", "path"), [("POST", "/v1/chat/"), ("GET", "/healthz/"), ("POST", "/v1/chat//"), ("GET", "/readyz/")]
+)
+def test_trailing_slash_gets_the_uniform_503_not_a_redirect(gateway, sink, method, path):
+    """F2: redirect_slashes=False, so a trailing slash is a routing miss, never a 307 with a Location header."""
+    kwargs = {"json": {"user_prompt": "hi"}} if method == "POST" else {}
+    (response,) = run_client(gateway, (method, path, kwargs))
+    assert_uniform(response)
+    assert "location" not in response.headers
+    assert sink.records == []  # routing misses are not attack outcomes (§3.2)
+
+
 def test_routing_misses_are_not_logged_as_attack_outcomes(gateway, sink):
     run_client(gateway, ("GET", "/nope", {}), ("DELETE", "/v1/chat", {}))
     assert sink.records == []
@@ -415,6 +483,39 @@ def test_refusal_records_carry_mode_hash_and_latency(gateway, sink):
     assert record.prompt_hash == prompt_hash("hello")
     assert record.total_latency_ms >= 0
     assert record.layer_results == ()  # L1 to L4 are Step 5+ hooks; nothing is faked
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"user_prompt": "field cap prompt", "aegis_context": [{"id": f"d{i}", "source": "s", "text": "t"} for i in range(5)]},
+        {"user_prompt": "field cap prompt", "aegis_context": [{"id": "d1", "source": "s", "text": "t" * 1501}]},
+    ],
+    ids=["five-documents", "long-document"],
+)
+def test_field_cap_refusal_logs_the_parsed_prompt_hash(gateway, sink, payload):
+    """F7: field caps run after parsing, so the record carries the real prompt hash, not UNPARSED_PROMPT_HASH."""
+    from app.inspection import prompt_hash
+
+    (response,) = run_client(gateway, ("POST", "/v1/chat", {"json": payload}))
+    assert_uniform(response)
+    (record,) = sink.records
+    assert (record.outcome, record.blocked_by) == (Outcome.BLOCKED_INGRESS, "schema_validation")
+    assert record.prompt_hash == prompt_hash("field cap prompt") != UNPARSED_PROMPT_HASH
+
+
+def test_field_cap_on_prompt_length_logs_the_parsed_prompt_hash(tmp_path, sink):
+    from app.inspection import prompt_hash
+
+    app = create_app(make_settings(tmp_path, MAX_PROMPT_CHARS=10), sink)
+    (response,) = run_client(app, ("POST", "/v1/chat", {"json": {"user_prompt": "eleven char"}}))
+    assert_uniform(response)
+    assert [(r.blocked_by, r.prompt_hash) for r in sink.records] == [("schema_validation", prompt_hash("eleven char"))]
+
+
+def test_schema_violation_before_parsing_keeps_the_unparsed_hash(gateway, sink):
+    run_client(gateway, ("POST", "/v1/chat", {"json": {"user_prompt": "hi", "extra": 1}}))
+    assert [(r.blocked_by, r.prompt_hash) for r in sink.records] == [("schema_validation", UNPARSED_PROMPT_HASH)]
 
 
 def test_sink_failure_never_changes_the_response(gateway, sink):

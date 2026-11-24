@@ -2,7 +2,10 @@
 
 Deterministic gateway modes (`eval`, `shadow_ingress_only`, `shadow_full_e2e`)
 derive every value from `HMAC_SECRET` with a distinct domain tag (`canary|`,
-`pii|`, `nonce|`) so no two domains can collide. Random modes (`production`,
+`pii|`, `nonce|`) so no two domains can collide. Every message field
+(`objective_id`, `entity_type`, `doc_id`) is refused if it contains `|`, the
+field separator, so two different argument tuples can never build the same
+HMAC message (PS-3). Random modes (`production`,
 `demo`) draw fresh values from `secrets`. Every `derive_*` function requires
 `mode`, so a caller can never fall back to deterministic secrets by omission.
 Canonical mode sets and `resolve_derivation_mode` live in `contracts.modes`.
@@ -64,12 +67,31 @@ __all__ = [
 ]
 
 
+FIELD_SEPARATOR = "|"
+
+
+def _reject_separator(**fields: str) -> None:
+    """Refuse any HMAC message field containing the `|` separator (PS-3).
+
+    Without this check `("O1|d", "x")` and `("O1", "d|x")` would build the same
+    message `nonce|O1|d|x` and derive the same value. The check runs in every
+    mode so a bad identifier fails the same way in production and in eval.
+    `secret` is the HMAC key, not a message field, so it is not restricted.
+    """
+    for name, value in fields.items():
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must be a str")
+        if FIELD_SEPARATOR in value:
+            raise ValueError(f"{name} must not contain the {FIELD_SEPARATOR!r} HMAC field separator (PS-3)")
+
+
 def _hmac_hex(secret: str, message: str) -> str:
     return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def derive_canary(secret: str, objective_id: str, *, mode: str) -> str:
     """Canary token: `HMAC-SHA256(secret, "canary|{objective_id}")` in deterministic modes."""
+    _reject_separator(objective_id=objective_id)
     if resolve_derivation_mode(mode) == "deterministic":
         return f"{CANARY_PREFIX}{_hmac_hex(secret, f'canary|{objective_id}')[:24]}"
     return f"{CANARY_PREFIX}{secrets.token_hex(16)}"
@@ -158,6 +180,7 @@ def _thread_faker() -> Faker:
 
 def derive_synthetic_pii(secret: str, objective_id: str, entity_type: str, *, mode: str) -> str:
     """Synthetic PII value for one entity type, from an isolated seeded Faker."""
+    _reject_separator(objective_id=objective_id, entity_type=entity_type)
     kind = resolve_derivation_mode(mode)
     if entity_type not in PII_ENTITY_TYPES:
         raise ValueError(f"entity_type must be one of {PII_ENTITY_TYPES}, got {entity_type!r}")
@@ -172,6 +195,7 @@ def derive_synthetic_pii(secret: str, objective_id: str, entity_type: str, *, mo
 
 def derive_sanitizer_nonce(secret: str, objective_id: str, doc_id: str, *, mode: str) -> str:
     """Per-document nonce: the full 64-hex HMAC digest (deterministic) or 32 random hex (random)."""
+    _reject_separator(objective_id=objective_id, doc_id=doc_id)
     if resolve_derivation_mode(mode) == "deterministic":
         return _hmac_hex(secret, f"nonce|{objective_id}|{doc_id}")
     return secrets.token_hex(16)

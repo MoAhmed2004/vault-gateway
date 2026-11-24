@@ -14,8 +14,13 @@ factory runs (fail fast, §2.7, PS-3). The lifespan opens the telemetry sink
 on startup and, on shutdown, flushes it and closes it when the app owns it
 (an injected sink is flushed but left for its owner to close).
 
-Middleware order, outermost first: `FailClosedMiddleware`, `BodyCapMiddleware`,
-then FastAPI's exception middleware and router.
+Middleware order, outermost first: Starlette's own `ServerErrorMiddleware`
+(always added by Starlette, outside every user middleware; its handler is the
+registered global `Exception` handler, so it also answers with the uniform
+503), `FailClosedMiddleware`, `BodyCapMiddleware`, then FastAPI's exception
+middleware and router. Trailing-slash redirects are disabled
+(`redirect_slashes=False`) so a path such as `/v1/chat/` is a routing miss
+with the uniform 503, not a 307 (TM-R6).
 """
 
 from __future__ import annotations
@@ -83,7 +88,8 @@ def create_app(
             _shutdown_sink(sink, owned=owned)
             logger.info("gateway stopped")
 
-    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    # redirect_slashes=False: `/v1/chat/` gets the uniform 503, never a 307 redirect (TM-R6).
+    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
     app.state.settings = resolved
     app.state.inspection_config = inspection_config
     app.state.telemetry = None

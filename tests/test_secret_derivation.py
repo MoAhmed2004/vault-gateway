@@ -169,12 +169,41 @@ def test_nonce_random_modes_differ_and_at_least_128_bits(mode):
 
 
 def test_nonce_delimiter_ambiguity_does_not_collide():
-    assert derive_sanitizer_nonce(SECRET, "a|b", "c", mode="eval") == derive_sanitizer_nonce(
-        SECRET, "a|b", "c", mode="eval"
-    )
+    """F6: ("O1|d", "x") and ("O1", "d|x") would build the same message, so both are refused."""
+    for objective_id, doc_id in (("O1|d", "x"), ("O1", "d|x")):
+        with pytest.raises(ValueError, match="separator"):
+            derive_sanitizer_nonce(SECRET, objective_id, doc_id, mode="eval")
     assert derive_sanitizer_nonce(SECRET, "O1", "d1", mode="eval") != derive_sanitizer_nonce(
         SECRET, "O1", "d1 ", mode="eval"
     )
+
+
+SEPARATOR_CALLS = [
+    ("derive_canary/objective_id", lambda mode: derive_canary(SECRET, "O1|x", mode=mode)),
+    ("derive_canary/objective_id-only-pipe", lambda mode: derive_canary(SECRET, "|", mode=mode)),
+    ("derive_synthetic_pii/objective_id", lambda mode: derive_synthetic_pii(SECRET, "O1|x", "US_SSN", mode=mode)),
+    ("derive_synthetic_pii/entity_type", lambda mode: derive_synthetic_pii(SECRET, "O1", "US_SSN|x", mode=mode)),
+    ("derive_sanitizer_nonce/objective_id", lambda mode: derive_sanitizer_nonce(SECRET, "O1|d", "x", mode=mode)),
+    ("derive_sanitizer_nonce/doc_id", lambda mode: derive_sanitizer_nonce(SECRET, "O1", "d|x", mode=mode)),
+]
+
+
+@pytest.mark.parametrize("mode", ["eval", "shadow_ingress_only", "shadow_full_e2e", "production", "demo"])
+@pytest.mark.parametrize(("label", "call"), SEPARATOR_CALLS, ids=[label for label, _ in SEPARATOR_CALLS])
+def test_every_derive_function_rejects_the_field_separator(label, call, mode):
+    """F6 (PS-3): `|` is refused in every HMAC message field, in every mode."""
+    with pytest.raises(ValueError, match="separator"):
+        call(mode)
+
+
+def test_secret_itself_may_contain_the_separator():
+    """The HMAC key is not part of the message, so `|` there cannot cause a collision."""
+    assert derive_sanitizer_nonce("key|with|pipes", "O1", "d1", mode="eval") == _hmac("nonce|O1|d1", "key|with|pipes")
+
+
+def test_non_string_message_fields_are_rejected():
+    with pytest.raises(TypeError):
+        derive_canary(SECRET, 1, mode="eval")  # type: ignore[arg-type]
 
 
 # PII (Finding 1: libphonenumber US validation + real Presidio 100% detection across 200 objectives)

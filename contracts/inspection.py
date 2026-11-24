@@ -9,7 +9,9 @@ read the bundle.
 The schema enforces "nothing is truncated or left unscanned" (IP-2): every
 window's text is exactly its slice of the view, the windows of each view (and
 of each plan) cover the whole view, and no view holds more than
-`max_windows_per_view` windows. A bundle whose views would break a cap is
+`max_windows_per_view` windows. `prompt_hash` must be
+`canonical_hash({"raw_view": raw_view})`, so a bundle cannot carry the IP-5
+cache key of a different prompt. A bundle whose views would break a cap is
 never built; the builder returns `CapExceeded` instead, which maps to
 `Outcome.BLOCKED_INGRESS` with `blocked_by` `"decoded_cap"` or `"window_cap"`
 and the uniform 503 (TM-R6).
@@ -22,6 +24,8 @@ from __future__ import annotations
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+
+from contracts.hashing import canonical_hash
 
 ViewName = Literal["raw_view", "decoded_view"]
 CapReason = Literal["decoded_cap", "window_cap"]
@@ -130,6 +134,8 @@ class InspectionBundle(BaseModel):
     def _nothing_truncated_or_unscanned(self) -> InspectionBundle:
         if self.truncation_count != 0:
             raise ValueError("truncation_count must be 0 (IP-2: never truncate)")
+        if self.prompt_hash != canonical_hash({"raw_view": self.raw_view}):
+            raise ValueError("prompt_hash must equal canonical_hash({'raw_view': raw_view}) (IP-5)")
         if len(self.decoded_view) > self.max_decoded_chars:
             raise ValueError("decoded_view exceeds max_decoded_chars; build CapExceeded instead (TM-R1)")
         limit = self.max_windows_per_view

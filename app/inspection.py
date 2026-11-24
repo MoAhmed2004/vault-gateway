@@ -9,9 +9,18 @@ Decoded view (IP-1), built from the raw view, which is never altered:
    characters long or carries explicit `=` padding. Hex (even length, at least
    20 hex digits) is tried before Base64. A candidate is substituted only if
    its decoded bytes are valid UTF-8 with at least 85% printable characters.
-   Adjacent candidates separated only by whitespace are first tried joined,
-   under the same checks. Every decoded segment is normalized again (NFKC and
-   `Cf` strip) before substitution, and each pass ends with a full re-normalization.
+   Adjacent candidates separated only by whitespace are tried joined, under
+   the same checks. From each position the decoder scans contiguous runs of
+   adjacent candidates forward, with no limit on the number of pieces, and
+   substitutes the longest run that passes. The scan is incremental: Base64
+   and hex decode block by block (4 characters to 3 bytes, 2 to 1), so each
+   token is decoded once per start position, never re-decoded as part of a
+   longer run, and a start position stops scanning the moment its bytes are
+   not valid UTF-8 or can no longer reach the 85% printable ratio. An ordinary
+   20+ character word next to a split payload therefore cannot hide the
+   payload, and neither can the payload's length. Every decoded segment is
+   normalized again (NFKC and `Cf` strip) before substitution, and each pass
+   ends with a full re-normalization.
 
 This module implements only the transforms IP-1 specifies. It does not fold
 cross-script homoglyphs (that is the optional H-NORM variant, §3.6) and does
@@ -32,10 +41,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import codecs
 import re
 import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+
+from pydantic import TypeAdapter, ValidationError
 
 from contracts.hashing import canonical_hash
 from contracts.inspection import (
@@ -43,11 +55,12 @@ from contracts.inspection import (
     DecodeStep,
     InspectionBundle,
     TextWindow,
+    TokenizerName,
     ViewName,
     WindowPlan,
 )
 
-BUNDLE_ALGORITHM_REVISION = 1
+BUNDLE_ALGORITHM_REVISION = 3
 WINDOW_CHARS = 600
 WINDOW_STRIDE = 300
 MAX_WINDOWS_PER_VIEW = 16
@@ -61,17 +74,26 @@ DEBERTA_TOKEN_LIMIT = 512
 _TOKEN = re.compile(r"[A-Za-z0-9+/]+={0,2}")
 _HEX = re.compile(r"[0-9A-Fa-f]+")
 _PRINTABLE_WHITESPACE = frozenset("\n\r\t")
+_TOKENIZER_NAME = TypeAdapter(TokenizerName)
 
 
 @dataclass(frozen=True)
 class TokenizerLimit:
-    """A consumer's tokenizer limit. `count_tokens` must include any special tokens the model adds."""
+    """A consumer's tokenizer limit. `count_tokens` must include any special tokens the model adds.
+
+    `name` is checked against the frozen `contracts.inspection.TokenizerName`
+    pattern here, so a bad name fails at startup instead of on every request.
+    """
 
     name: str
     token_limit: int
     count_tokens: Callable[[str], int] = field(compare=False)
 
     def __post_init__(self) -> None:
+        try:
+            _TOKENIZER_NAME.validate_python(self.name, strict=True)
+        except ValidationError:
+            raise ValueError(f"tokenizer name {self.name!r} does not match the TokenizerName pattern") from None
         if self.token_limit <= 0:
             raise ValueError("token_limit must be positive")
 
@@ -110,6 +132,7 @@ class InspectionConfig:
                 "decode_depth": DECODE_DEPTH,
                 "min_candidate_chars": MIN_CANDIDATE_CHARS,
                 "min_printable_ratio": MIN_PRINTABLE_RATIO,
+                "join_scan": "incremental-uncapped",
                 "tokenizers": sorted([t.name, t.token_limit] for t in self.tokenizers),
             }
         )
@@ -193,18 +216,192 @@ def _candidate_groups(text: str) -> list[list[re.Match[str]]]:
     return groups
 
 
+_MAX_BAD_RATIO = 1.0 - MIN_PRINTABLE_RATIO
+# ASCII bytes the IP-1 predicate counts as printable: space to tilde, newline, return, tab.
+_PRINTABLE_ASCII = bytes(range(0x20, 0x7F)) + b"\n\r\t"
+
+
+def _printable_count(text: str) -> int:
+    """Characters the IP-1 predicate counts as printable (`isprintable`, plus newline, return, tab)."""
+    if text.isprintable():
+        return len(text)
+    return sum(map(str.isprintable, text)) + text.count("\n") + text.count("\r") + text.count("\t")
+
+
+class _RunScan:
+    """Shared state of one forward scan: strict incremental UTF-8 plus the printable tally.
+
+    Subclasses turn tokens into bytes block by block. `alive` becomes False as
+    soon as no longer run from the same start can be valid: the bytes are not
+    UTF-8, the token breaks the encoding's rules, or too many characters are
+    non-printable for the 85% ratio to be reachable even if every remaining
+    character were printable.
+    """
+
+    def __init__(self) -> None:
+        self.decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        self.chars = 0
+        self.bad = 0
+        self.nbytes = 0
+        self.pending = False  # the decoder holds the start of a multi-byte character
+        self.alive = True
+
+    def _feed_bytes(self, data: bytes, future_chars: int) -> None:
+        self.nbytes += len(data)
+        if not self.pending and data.isascii():
+            # Fast path: one byte is one character, so no decoder call is needed.
+            self.chars += len(data)
+            self.bad += len(data.translate(None, _PRINTABLE_ASCII))
+        else:
+            try:
+                decoded = self.decoder.decode(data, False)
+            except UnicodeDecodeError:
+                self.alive = False
+                return
+            self.pending = bool(self.decoder.getstate()[0])
+            if decoded:
+                self.chars += len(decoded)
+                self.bad += len(decoded) - _printable_count(decoded)
+        # Best case: every later character is printable. The slack covers a pending carry.
+        if self.bad > _MAX_BAD_RATIO * (self.chars + future_chars) + 3:
+            self.alive = False
+
+    def _text_passes(self, extra: bytes) -> bool:
+        """The IP-1 checks on everything fed so far plus `extra`, without disturbing the scan."""
+        chars, bad = self.chars, self.bad
+        if extra:
+            if not self.pending and extra.isascii():
+                chars += len(extra)
+                bad += len(extra.translate(None, _PRINTABLE_ASCII))
+            else:
+                probe = codecs.getincrementaldecoder("utf-8")("strict")
+                probe.setstate(self.decoder.getstate())
+                try:
+                    tail = probe.decode(extra, True)
+                except UnicodeDecodeError:
+                    return False
+                chars += len(tail)
+                bad += len(tail) - _printable_count(tail)
+        elif self.pending:
+            return False  # truncated multi-byte character
+        if self.nbytes + len(extra) == 0:
+            return False
+        return (chars - bad) >= MIN_PRINTABLE_RATIO * chars
+
+
+class _Base64Scan(_RunScan):
+    def __init__(self) -> None:
+        super().__init__()
+        self.carry = ""
+        self.closed = False  # a token with `=` padding ends the run
+
+    def feed(self, token: str, future_chars: int) -> None:
+        if self.closed:
+            self.alive = False
+            return
+        data = self.carry + token
+        if token.endswith("="):
+            if len(data) % 4:
+                self.alive = False
+                return
+            chunk, self.carry, self.closed = data, "", True
+        else:
+            cut = len(data) - len(data) % 4
+            chunk, self.carry = data[:cut], data[cut:]
+        if chunk:
+            try:
+                raw = binascii.a2b_base64(chunk)
+            except (binascii.Error, ValueError):
+                self.alive = False
+                return
+            self._feed_bytes(raw, future_chars * 3 // 4 + 3)
+
+    def stop(self) -> bool | None:
+        """None if the run so far is not valid; else whether it ends on a block boundary or padding."""
+        size = len(self.carry)
+        if size == 1:
+            return None
+        extra = b""
+        if size:
+            try:
+                extra = binascii.a2b_base64(self.carry + "=" * (4 - size))
+            except (binascii.Error, ValueError):
+                return None
+        return (size == 0) if self._text_passes(extra) else None
+
+
+class _HexScan(_RunScan):
+    def __init__(self) -> None:
+        super().__init__()
+        self.carry = ""
+        self.length = 0
+
+    def feed(self, token: str, future_chars: int) -> None:
+        if not _HEX.fullmatch(token):
+            self.alive = False
+            return
+        self.length += len(token)
+        data = self.carry + token
+        cut = len(data) - len(data) % 2
+        chunk, self.carry = data[:cut], data[cut:]
+        if chunk:
+            self._feed_bytes(bytes.fromhex(chunk), future_chars // 2 + 2)
+
+    def stop(self) -> bool | None:
+        if self.carry or self.length < MIN_CANDIDATE_CHARS or not self._text_passes(b""):
+            return None
+        return True
+
+
+def _longest_run(tokens: Sequence[str], suffix: Sequence[int], start: int) -> tuple[int, bool]:
+    """(end index exclusive, continues) of the longest valid run of adjacent tokens from `start`.
+
+    The end index is 0 when no run is valid. A run that stops before the end
+    of the group must end on a Base64 block boundary or padding, so the tokens
+    after it start on a fresh block. If no such stop exists, the longest run is
+    used anyway: an unpadded payload followed by an ordinary word ends
+    off-boundary and must not be left undecoded. `continues` is True when a
+    longer, off-boundary valid run exists beyond the returned stop; the caller
+    then decodes that remainder as the continuation of this run.
+    """
+    scans: list[_RunScan] = [_Base64Scan()]
+    if _HEX.fullmatch(tokens[start]):  # a non-hex first token rules hex out for every longer run
+        scans.append(_HexScan())
+    count = len(tokens)
+    best_any = best_clean = 0
+    for k in range(start, count):
+        future = suffix[k + 1]
+        token = tokens[k]
+        live = False
+        for scan in scans:
+            if scan.alive:
+                scan.feed(token, future)
+                if scan.alive:
+                    live = True
+                    aligned = scan.stop()
+                    if aligned is not None:
+                        best_any = k + 1
+                        if aligned or k + 1 == count:
+                            best_clean = k + 1
+        if not live:
+            break
+    end = best_clean or best_any
+    return end, best_any > end
+
+
 def _decode_pass(text: str, depth: int) -> tuple[str, list[DecodeStep]]:
     pieces: list[str] = []
     steps: list[DecodeStep] = []
     cursor = 0
 
-    def substitute(start: int, end: int, candidate: str, joined: bool) -> bool:
+    def substitute(start: int, end: int, candidate: str, joined: bool, glue: bool = False) -> bool:
         nonlocal cursor
         result = _try_decode(candidate)
         if result is None:
             return False
         encoding, decoded = result
-        pieces.append(text[cursor:start])
+        if not glue:  # a continuation drops the whitespace gap, exactly as one joined run would
+            pieces.append(text[cursor:start])
         pieces.append(decoded)
         cursor = end
         steps.append(
@@ -215,12 +412,21 @@ def _decode_pass(text: str, depth: int) -> tuple[str, list[DecodeStep]]:
         return True
 
     for group in _candidate_groups(text):
-        if len(group) > 1:
-            joined = "".join(m.group() for m in group)
-            if substitute(group[0].start(), group[-1].end(), joined, True):
-                continue
-        for match in group:
-            substitute(match.start(), match.end(), match.group(), False)
+        tokens = [m.group() for m in group]
+        suffix = [0] * (len(tokens) + 1)  # suffix[k] = characters in tokens[k:]
+        for k in range(len(tokens) - 1, -1, -1):
+            suffix[k] = suffix[k + 1] + len(tokens[k])
+        i = 0
+        glue_at = -1  # token index that continues the previous substitution
+        while i < len(group):
+            j, continues = _longest_run(tokens, suffix, i)
+            if j and substitute(
+                group[i].start(), group[j - 1].end(), "".join(tokens[i:j]), j - i > 1, glue=(i == glue_at)
+            ):
+                glue_at = j if continues else -1
+                i = j
+            else:
+                i += 1
     pieces.append(text[cursor:])
     return "".join(pieces), steps
 

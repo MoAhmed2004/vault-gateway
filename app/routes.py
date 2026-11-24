@@ -27,7 +27,7 @@ from starlette.responses import JSONResponse, Response
 
 from app.audit import record_refusal
 from app.errors import uniform_refusal_response
-from app.inspection import build_inspection_bundle
+from app.inspection import build_inspection_bundle, prompt_hash
 from app.schemas import GatewayRequest, field_cap_violation
 from contracts.inspection import CapExceeded
 
@@ -59,7 +59,8 @@ async def chat(payload: GatewayRequest, request: Request) -> Response:
         max_context_docs=settings.MAX_CONTEXT_DOCS,
         max_context_doc_chars=settings.MAX_CONTEXT_DOC_CHARS,
     ):
-        record_refusal(app, request.scope, "schema_validation")
+        # The prompt is already parsed here, so the record carries its real hash (RT-V6).
+        record_refusal(app, request.scope, "schema_validation", prompt_hash=prompt_hash(payload.user_prompt))
         return uniform_refusal_response()
 
     bundle = await run_in_threadpool(build_inspection_bundle, payload.user_prompt, app.state.inspection_config)

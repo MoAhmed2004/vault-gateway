@@ -4,7 +4,8 @@ Neither class subclasses `BaseHTTPMiddleware`, so no request body is ever
 buffered beyond what the cap allows.
 
 `BodyCapMiddleware` (TM-R1): before any JSON parsing, a request whose
-`Content-Length` exceeds the cap (or is malformed) is refused at once without
+`Content-Length` exceeds the cap (or is malformed: not ASCII digits, more
+than 20 digits, or conflicting) is refused at once as `body_cap` without
 reading a single body byte. Otherwise the middleware counts bytes as chunks
 arrive and stops reading the instant the running total exceeds the cap, also
 when the client sends no `Content-Length` (chunked transfer) or lies in it. A
@@ -12,10 +13,21 @@ body within the cap (at most `max_body_bytes`, so memory stays bounded) is
 replayed to the application unchanged. Exactly `max_body_bytes` is accepted;
 one byte more is refused.
 
-`FailClosedMiddleware` (TM-R6): the outermost application middleware. It
-records the start time and `X-Trial-ID` (server-side only) and turns any
-exception raised below it into the uniform 503 when the response has not
-started yet, so a fault never reaches a default error page.
+`FailClosedMiddleware` (TM-R6): the outermost middleware registered by the
+gateway. It records the start time and `X-Trial-ID` (server-side only) and
+turns any exception raised below it into the uniform 503 when the response
+has not started yet, so a fault never reaches a default error page.
+
+Starlette itself always wraps the user middleware stack in its own
+`ServerErrorMiddleware`, so that class sits outside `FailClosedMiddleware`.
+It only sees an exception that escapes `FailClosedMiddleware`, and because
+the gateway registers a global `Exception` handler (`app.errors`), Starlette
+uses that handler there too: the response is still the uniform 503, never
+the default 500 page.
+
+Out of scope for TM-R6: uvicorn answers a request it cannot parse as HTTP
+(for example a malformed request line or header) with its own plain-text
+400 before the ASGI app is called, so no gateway code can shape that reply.
 """
 
 from __future__ import annotations
@@ -52,7 +64,9 @@ def _content_length(headers: list[tuple[bytes, bytes]]) -> int | None | str:
     parsed = set()
     for value in values:
         text = value.decode("latin-1").strip()
-        if not text.isdigit():
+        # ASCII digits only (latin-1 superscripts such as b"\xb2" pass str.isdigit but not int()),
+        # and at most 20 digits so int() never meets Python's integer string conversion limit.
+        if not (text.isascii() and text.isdigit()) or len(text) > 20:
             return "invalid"
         parsed.add(int(text))
     if len(parsed) != 1:
