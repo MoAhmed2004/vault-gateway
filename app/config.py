@@ -28,6 +28,10 @@ from contracts.paths import synced_folder_component
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOG_DB_PATH = REPO_ROOT / "data" / "logs" / "vault.db"
+DEFAULT_CACHE_DB_PATH = REPO_ROOT / "data" / "cache" / "vault_cache.db"
+DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+STEP_5B_EGRESS_VARIANTS = frozenset({"X3"})
+_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 
 DEFAULT_HMAC_SECRET = "vault_dev_secret_change_me"
 MIN_HMAC_SECRET_CHARS = 16
@@ -40,6 +44,8 @@ DEFAULT_PROBE_CANDIDATES: tuple[str, ...] = (
 GatewayModeName = GatewayMode
 TimeoutPolicyName = Literal["P-open", "P-degrade", "P-closed"]
 UpstreamModeName = Literal["groq", "ollama", "stub"]
+EgressVariantName = Literal["X0", "X1", "X2", "X3"]
+ReasoningEffortName = Literal["none", "low", "medium", "high"]
 
 PositiveInt = Annotated[int, Field(gt=0)]
 
@@ -97,6 +103,25 @@ class Settings(BaseSettings):
     PROBE_CANDIDATES: tuple[str, ...] = DEFAULT_PROBE_CANDIDATES
     ALLOW_MODEL_FAILOVER: bool = False
 
+    # Upstream client (§2.7: one client module; target parameters are part of the IP-5 response key)
+    GROQ_BASE_URL: str = DEFAULT_GROQ_BASE_URL
+    UPSTREAM_TIMEOUT_S: float = Field(default=20.0, gt=0.0, le=120.0, allow_inf_nan=False)
+    TARGET_MAX_TOKENS: PositiveInt = 256
+    TARGET_TEMPERATURE: float = Field(default=0.0, ge=0.0, le=2.0, allow_inf_nan=False)
+    TARGET_SEED: int = 0
+    TARGET_REASONING_EFFORT: ReasoningEffortName | None = None
+
+    # Egress (IP-6): X0 none, X1 Presidio, X2 Presidio + exact canary; X3 needs the Step 5B similarity check
+    EGRESS_VARIANT: EgressVariantName = "X2"
+
+    # Caches (IP-5, IP-8: local disk only, cache writes bypassed during E4)
+    CACHE_DB_PATH: Path = DEFAULT_CACHE_DB_PATH
+    CACHE_ENABLED: bool = True
+    CACHE_WRITES_ENABLED: bool = True
+
+    # Objective whose canary and planted PII the gateway-built system prompt carries (PS-2, PS-3)
+    OBJECTIVE_ID: str = "gateway-session"
+
     # Modes and policies
     GATEWAY_MODE: GatewayModeName = "production"
     TIMEOUT_POLICY: TimeoutPolicyName = "P-degrade"
@@ -118,6 +143,7 @@ class Settings(BaseSettings):
     L1_BUDGET_MS: PositiveInt = 5
     L2_BUDGET_MS: PositiveInt = 50
     L3_BUDGET_MS: PositiveInt = 150
+    L4_BUDGET_MS: PositiveInt = 150
     TOTAL_BUDGET_MS: PositiveInt = 400
     P_DEGRADE_THRESHOLD_DELTA: float = Field(default=0.05, ge=0.0, allow_inf_nan=False)
 
@@ -164,11 +190,40 @@ class Settings(BaseSettings):
             raise ValueError("ALLOW_MODEL_FAILOVER must be false: runtime failover would mix models mid-experiment (§2.7, §3.9)")
         return value
 
-    @field_validator("LOG_DB_PATH")
+    @field_validator("LOG_DB_PATH", "CACHE_DB_PATH")
     @classmethod
     def _anchor_log_path(cls, value: Path) -> Path:
         path = value.expanduser()
         return path if path.is_absolute() else REPO_ROOT / path
+
+    @field_validator("TARGET_REASONING_EFFORT", mode="before")
+    @classmethod
+    def _blank_effort_is_none(cls, value: Any) -> Any:
+        return None if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("EGRESS_VARIANT")
+    @classmethod
+    def _variant_is_implemented(cls, value: str) -> str:
+        if value in STEP_5B_EGRESS_VARIANTS:
+            raise ValueError(
+                "EGRESS_VARIANT=X3 needs the decoded-text and similarity leak check (§2.1), planned for Step 5B"
+            )
+        return value
+
+    @field_validator("OBJECTIVE_ID")
+    @classmethod
+    def _objective_id_is_identifier(cls, value: str) -> str:
+        if not _IDENTIFIER.fullmatch(value):
+            raise ValueError("OBJECTIVE_ID must match the contracts identifier pattern (no '|', PS-3)")
+        return value
+
+    @field_validator("GROQ_BASE_URL")
+    @classmethod
+    def _base_url_is_https(cls, value: str) -> str:
+        text = value.strip().rstrip("/")
+        if not text.startswith("https://"):
+            raise ValueError("GROQ_BASE_URL must be an https:// URL")
+        return text
 
     @model_validator(mode="after")
     def _startup_guards(self) -> Settings:
@@ -181,10 +236,14 @@ class Settings(BaseSettings):
                 )
         if self.UPSTREAM_MODE == "groq" and is_placeholder_api_key(self.GROQ_API_KEY):
             raise ValueError("GROQ_API_KEY is a placeholder value; set a real key or leave it blank")
-        offender = synced_folder_component(self.LOG_DB_PATH.resolve())
-        if offender is not None:
+        for name, path in (("LOG_DB_PATH", self.LOG_DB_PATH), ("CACHE_DB_PATH", self.CACHE_DB_PATH)):
+            offender = synced_folder_component(path.resolve())
+            if offender is not None:
+                raise ValueError(f"{name} must be on local disk, not a synced folder (IP-8): component {offender!r}")
+        layer_sum = self.L1_BUDGET_MS + self.L2_BUDGET_MS + self.L3_BUDGET_MS + self.L4_BUDGET_MS
+        if layer_sum > self.TOTAL_BUDGET_MS:
             raise ValueError(
-                f"LOG_DB_PATH must be on local disk, not a synced folder (IP-8): component {offender!r}"
+                f"L1 to L4 budgets sum to {layer_sum} ms, above TOTAL_BUDGET_MS={self.TOTAL_BUDGET_MS} (TM-R2)"
             )
         return self
 

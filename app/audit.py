@@ -56,6 +56,53 @@ def outcome_for(blocked_by: str) -> Outcome:
     return Outcome.BLOCKED_INGRESS if blocked_by in INGRESS_BLOCK_REASONS else Outcome.ERROR
 
 
+def record_request(
+    app: Any,
+    scope: MutableMapping[str, Any],
+    *,
+    outcome: Outcome,
+    prompt_hash: str,
+    blocked_by: str | None = None,
+    layer_results: tuple[LayerResult, ...] = (),
+    target_called: bool = False,
+    **fields: Any,
+) -> None:
+    """Log one request to the configured sink, at most once per request (RT-V6).
+
+    `fields` are the remaining optional `RequestLogRecord` fields (`cache_hit`,
+    `model_id`, `egress_variant`, `egress_action`, `reasoning_findings`,
+    `timeout_policy`). The record validates the §3.2 outcome rules; a record
+    that fails them is reported to the Python logger and never changes the
+    response.
+    """
+    state = scope_state(scope)
+    if state.get(STATE_LOGGED):
+        return
+    state[STATE_LOGGED] = True
+    sink = getattr(getattr(app, "state", None), "telemetry", None)
+    settings = getattr(getattr(app, "state", None), "settings", None)
+    if sink is None or settings is None:
+        logger.error("request (%s, %s) not logged: telemetry sink or settings missing", outcome, blocked_by)
+        return
+    started = state.get(STATE_STARTED, time.perf_counter())
+    try:
+        record = RequestLogRecord(
+            timestamp_utc=datetime.now(UTC).isoformat(),
+            gateway_mode=settings.GATEWAY_MODE,
+            prompt_hash=prompt_hash,
+            layer_results=layer_results,
+            target_called=target_called,
+            outcome=outcome,
+            total_latency_ms=max(0.0, (time.perf_counter() - started) * 1000.0),
+            blocked_by=blocked_by,
+            trial_id=state.get(STATE_TRIAL_ID),
+            **fields,
+        )
+        sink.record_request(record)
+    except Exception:  # noqa: BLE001  logging must never change the response
+        logger.exception("failed to log request (%s, %s)", outcome, blocked_by)
+
+
 def record_refusal(
     app: Any,
     scope: MutableMapping[str, Any],
@@ -65,28 +112,7 @@ def record_refusal(
     layer_results: tuple[LayerResult, ...] = (),
 ) -> None:
     """Log one refused request (target never called) to the configured sink, at most once per request."""
-    state = scope_state(scope)
-    if state.get(STATE_LOGGED):
-        return
-    state[STATE_LOGGED] = True
-    sink = getattr(getattr(app, "state", None), "telemetry", None)
-    settings = getattr(getattr(app, "state", None), "settings", None)
-    if sink is None or settings is None:
-        logger.error("refusal %s not logged: telemetry sink or settings missing", blocked_by)
-        return
-    started = state.get(STATE_STARTED, time.perf_counter())
-    try:
-        record = RequestLogRecord(
-            timestamp_utc=datetime.now(UTC).isoformat(),
-            gateway_mode=settings.GATEWAY_MODE,
-            prompt_hash=prompt_hash,
-            layer_results=layer_results,
-            target_called=False,
-            outcome=outcome_for(blocked_by),
-            total_latency_ms=max(0.0, (time.perf_counter() - started) * 1000.0),
-            blocked_by=blocked_by,
-            trial_id=state.get(STATE_TRIAL_ID),
-        )
-        sink.record_request(record)
-    except Exception:  # noqa: BLE001  logging must never change the response
-        logger.exception("failed to log refusal %s", blocked_by)
+    record_request(
+        app, scope, outcome=outcome_for(blocked_by), prompt_hash=prompt_hash, blocked_by=blocked_by,
+        layer_results=layer_results,
+    )

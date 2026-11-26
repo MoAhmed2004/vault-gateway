@@ -315,12 +315,7 @@ def test_lone_unpadded_token_before_a_long_word_is_still_decoded():
     assert result.decoded_view == "sixteen byte txt Pneumonoultramicroscopic"
 
 
-def test_scan_work_stays_linear_on_hostile_candidate_floods(monkeypatch):
-    """TM-R1 / TM-R2: 181 junk or non-printable candidates in 4,000 characters never re-decode earlier tokens.
-
-    The naive uncapped design re-decoded every longer run from every start (about 16,400 token decodes for 181
-    tokens). The incremental scan abandons a start once its bytes cannot become valid text.
-    """
+def _count_feeds(monkeypatch):
     import app.inspection as inspection
 
     feeds = {"count": 0}
@@ -331,6 +326,17 @@ def test_scan_work_stays_linear_on_hostile_candidate_floods(monkeypatch):
         return original(self, token, future_chars)
 
     monkeypatch.setattr(inspection._Base64Scan, "feed", counting)
+    return feeds
+
+
+def test_scan_work_is_pruned_on_hostile_candidate_floods(monkeypatch):
+    """TM-R1 / TM-R2: 181 junk or all non-printable candidates in 4,000 characters are abandoned early.
+
+    The naive uncapped design re-decoded every longer run from every start (about 16,400 token decodes for 181
+    tokens). On these floods the pruning rule stops each start within a few tokens, so the work stays far below
+    that. It is not linear in general: see the near-threshold flood below.
+    """
+    feeds = _count_feeds(monkeypatch)
     rng = random.Random(5)
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     floods = {
@@ -346,6 +352,26 @@ def test_scan_work_stays_linear_on_hostile_candidate_floods(monkeypatch):
         view, steps = build_decoded_view(raw)
         assert view == raw and steps == (), name
         assert feeds["count"] <= 6000, (name, feeds["count"])
+
+
+def test_scan_work_is_quadratic_but_bounded_on_a_near_threshold_flood(monkeypatch):
+    """Audit finding L1 (Step 4.6): the worst case is quadratic, about 77% of the naive feed count, not linear.
+
+    190 identical 15-byte tokens, each 3 non-printable bytes (20% non-printable, just above the 15% the 85% rule
+    allows). Every start stays alive for most of the remaining run, because later printable characters could in
+    principle still lift the ratio, so pruning fires late. Measured: 13,913 token feeds against 18,145 for the
+    naive uncapped design (190 * 191 / 2), about 21 to 26 ms on one developer machine (the Step 4.6 audit measured
+    about 13 ms against about 346 ms naive), inside the 400 ms TM-R2 budget. The bound asserts work, not time.
+    """
+    feeds = _count_feeds(monkeypatch)
+    token = b64(bytes([1, 2, 3]) + b"abcdefghijkl")
+    assert len(token) == 20
+    raw = " ".join([token] * 190)
+    assert len(raw) <= 4000
+    view, steps = build_decoded_view(raw)
+    assert view == raw and steps == ()  # never substituted: 20% non-printable fails the 85% rule
+    naive = 190 * 191 // 2
+    assert feeds["count"] <= 16_000 < naive, feeds["count"]
 
 
 def test_decoded_segment_is_normalized_again():
