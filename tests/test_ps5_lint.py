@@ -72,6 +72,21 @@ def test_dataset_and_cache_dirs_skipped_with_jsonl(tmp_path, rel):
     assert ps5_lint.main(["--root", str(tmp_path)]) == 0
 
 
+def test_only_the_root_models_dir_is_skipped(tmp_path):
+    """AGENTS.md Rule 11: root `models/` (downloaded tokenizers) is skipped; `app/models/` and `harness/models/` are not."""
+    vocab = tmp_path / "models" / "minilm"
+    vocab.mkdir(parents=True)
+    (vocab / "tokenizer.json").write_text('{"vocab": "' + EMOJI_ROCKET + EM_DASH + '"}', encoding="utf-8")
+    assert ps5_lint.lint([tmp_path]) == []
+    for nested in ("app/models", "harness/models"):
+        d = tmp_path / nested
+        d.mkdir(parents=True)
+        (d / "notes.md").write_text(f"bad {EM_DASH}\n", encoding="utf-8")
+    hits = ps5_lint.lint([tmp_path])
+    assert sorted(h.path.relative_to(tmp_path.resolve()).parent.as_posix() for h in hits) == ["app/models", "harness/models"]
+    assert ps5_lint.main(["--root", str(tmp_path)]) == 1
+
+
 def test_similar_named_dir_is_not_skipped(tmp_path):
     d = tmp_path / "metadata" / "raw"
     d.mkdir(parents=True)

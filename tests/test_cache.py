@@ -190,6 +190,29 @@ def test_egress_rows_are_bound_to_the_l4_version(cache):
     assert cache.stats.hits["egress_verdicts"] == 1 and cache.stats.misses["egress_verdicts"] == 1
 
 
+def test_an_l4_version_bump_overwrites_the_stale_egress_row(tmp_path, cache):
+    """Step 5A L4: the row written under the old L4 version is replaced, so the key is not a permanent miss."""
+    key = egress_verdict_key(response_hash=raw_response_hash(RAW), manifest_id=MANIFEST_ID, variant="X2")
+    old = {"variant": "X2", "verdict": "allow", "action": "none", "content": "old"}
+    new = {"variant": "X2", "verdict": "allow", "action": "masked", "content": "new"}
+    again = {"variant": "X2", "verdict": "allow", "action": "none", "content": "later write, same version"}
+    cache.put_egress(key, "l4-v2", old)
+    cache.flush()
+    cache.put_egress(key, "l4-v3", new)
+    cache.flush()
+    assert run(cache.get_egress(key, "l4-v3")) == new
+    assert run(cache.get_egress(key, "l4-v2")) is None
+    cache.put_egress(key, "l4-v3", again)  # same version: the first row stays (deterministic replay)
+    cache.flush()
+    assert run(cache.get_egress(key, "l4-v3")) == new
+    conn = sqlite3.connect(tmp_path / "cache" / "vault_cache.db")
+    try:
+        rows = conn.execute("SELECT l4_version FROM egress_verdicts WHERE cache_key = ?", (key,)).fetchall()
+    finally:
+        conn.close()
+    assert rows == [("l4-v3",)]
+
+
 # Target responses
 
 

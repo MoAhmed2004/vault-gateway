@@ -1,15 +1,115 @@
-"""Test doubles shared by the upstream and gateway tests. No network: every Groq call hits `httpx.MockTransport`."""
+"""Test doubles shared by the upstream, layer and gateway tests.
+
+No network: every Groq call hits `httpx.MockTransport`. `FakeEmbedder` and
+`FakeClassifier` are deterministic stand-ins for MiniLM and DeBERTa with the
+same interface (`app.onnx_models.Embedder`, `Classifier`), so layer and
+pipeline logic is tested without model weights. Tests that need the real
+artifacts use `real_models_available()` and skip with a reason when
+`scripts/fetch_models.py` has not been run.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import re
+import threading
+import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
+import numpy as np
 
 from app.groq_client import GroqClient, target_parameters
+from app.inspection import TokenizerLimit
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+MINILM_DIR = REPO_ROOT / "models" / "minilm"
+DEBERTA_DIR = REPO_ROOT / "models" / "deberta"
+_WORDS = re.compile(r"\w+")
+
+
+def real_models_available() -> bool:
+    return all((d / f).is_file() for d in (MINILM_DIR, DEBERTA_DIR) for f in ("model.onnx", "tokenizer.json"))
+
+
+def real_tokenizer_limit(name: str, limit: int) -> TokenizerLimit:
+    """The real MiniLM or DeBERTa tokenizer as the gateway loads it (no truncation, special tokens counted,
+    MiniLM `max_input_chars_per_word` raised, M-3), without loading the model."""
+    from app.onnx_models import MINILM_MAX_INPUT_CHARS_PER_WORD, load_tokenizer
+
+    directory = MINILM_DIR if name == "minilm" else DEBERTA_DIR
+    word_limit = MINILM_MAX_INPUT_CHARS_PER_WORD if name == "minilm" else None
+    tokenizer = load_tokenizer(directory / "tokenizer.json", max_input_chars_per_word=word_limit)
+    return TokenizerLimit(name=name, token_limit=limit, count_tokens=lambda text: len(tokenizer.encode(text).ids))
+
+
+class FakeEmbedder:
+    """Bag-of-words hashing embedder: cosine similarity is word overlap. One token per word plus 2 specials."""
+
+    name = "minilm"
+    token_limit = 256
+
+    def __init__(self, *, dimension: int = 4096, delay_s: float = 0.0, version: str = "fake-embedder-v1") -> None:
+        self.dimension = dimension
+        self.delay_s = delay_s
+        self.version = version
+        self.calls = 0
+        self.on_embed: Callable[[str], None] | None = None
+        self._lock = threading.Lock()
+
+    def count_tokens(self, text: str) -> int:
+        return len(_WORDS.findall(text)) + 2
+
+    def embed(self, text: str) -> np.ndarray:
+        with self._lock:
+            self.calls += 1
+        if self.on_embed is not None:
+            self.on_embed(text)
+        if self.delay_s:
+            time.sleep(self.delay_s)
+        if self.count_tokens(text) > self.token_limit:
+            raise ValueError("above the fake token limit")
+        vector = np.zeros(self.dimension, dtype=np.float64)
+        for word in _WORDS.findall(text.casefold()):
+            vector[int(hashlib.sha256(word.encode()).hexdigest(), 16) % self.dimension] += 1.0
+        norm = np.linalg.norm(vector)
+        if norm == 0:
+            vector[0] = 1.0
+            norm = 1.0
+        return (vector / norm).astype(np.float32)
+
+
+class FakeClassifier:
+    """Malicious probability from trigger words; optional per-call delay for TM-R2 budget tests."""
+
+    name = "deberta"
+    token_limit = 512
+
+    def __init__(self, *, triggers: tuple[str, ...] = ("ignore", "jailbreak"), delay_s: float = 0.0,
+                 version: str = "fake-classifier-v1", fail: bool = False) -> None:
+        self.triggers = triggers
+        self.delay_s = delay_s
+        self.version = version
+        self.fail = fail
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def count_tokens(self, text: str) -> int:
+        return len(_WORDS.findall(text)) + 2
+
+    def malicious_probability(self, text: str) -> float:
+        with self._lock:
+            self.calls += 1
+        if self.fail:
+            raise RuntimeError("classifier exploded")
+        if self.delay_s:
+            time.sleep(self.delay_s)
+        words = set(_WORDS.findall(text.casefold()))
+        return 0.99 if words & set(self.triggers) else 0.01
 
 TARGET = "openai/gpt-oss-20b"
 ALL_CANDIDATES = ("openai/gpt-oss-20b", "qwen/qwen3.8-27b", "openai/gpt-oss-120b")

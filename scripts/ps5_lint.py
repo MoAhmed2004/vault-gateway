@@ -31,8 +31,9 @@ character (BOM, `U+200B`, `U+200D`, bidi embeddings, overrides and isolates
 there, and the allowlist applies nowhere else.
 
 Skipped: uncurated dataset and cache directories (`data/raw/`, `data/cache/`),
-virtualenv, VCS, results, ChromaDB, binary and PDF files (`BINARY_SUFFIXES`),
-and any file larger than 5 MiB.
+downloaded model artifacts (`models/`, whose third-party tokenizer vocabularies
+contain emoji and dashes as data), virtualenv, VCS, results, ChromaDB, binary
+and PDF files (`BINARY_SUFFIXES`), and any file larger than 5 MiB.
 
 TODO before W15: add text-level UI pattern checks for `linear-gradient`,
 `backdrop-filter`, `Inter`, `Space Grotesk`, `Instrument Serif`, and `lucide`.
@@ -97,6 +98,8 @@ SKIP_REL_DIRS = frozenset(
         "data/raw",
         "data/cache",
         "results",
+        # Downloaded third-party model artifacts (scripts/fetch_models.py); git-ignored, pinned by SHA-256.
+        "models",
     }
 )
 

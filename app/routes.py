@@ -8,16 +8,17 @@ uniform 503 (TM-R6), with the cause logged server-side.
 Pipeline, in order:
 1. Body cap (middleware) and schema validation (exception handlers).
 2. Config field caps (document count and length).
-3. `app.pipeline.run_chat`: InspectionBundle and its caps, L1 (L2 and L3 are
-   Step 5B hooks), the TM-R3 policy, the target through the IP-5 response
-   cache and the single Groq client module (§2.7), then L4 egress (IP-6,
-   TM-R4). Documents in `aegis_context` fail closed until the sanitizer
-   (TM-S1 to TM-S5) exists.
+3. `app.pipeline.run_chat`: InspectionBundle and its caps, L1, L2, L3 (IP-3
+   cascade, or IP-4 evaluate-all in the shadow modes), the TM-R3 policy, the
+   target through the IP-5 response cache and the single Groq client module
+   (§2.7), then L4 egress (IP-6, TM-R4). Documents in `aegis_context` fail
+   closed until the sanitizer (TM-S1 to TM-S5) exists.
 
 A released response is exactly `{"content": str}`; every other result is the
-uniform 503. Each request is logged once with its outcome, `blocked_by`,
-layer results, `target_called`, `cache_hit`, `model_id`, egress variant and
-action, and the reasoning finding labels (RT-V6, §3.2).
+uniform 503. Each request is logged once (RT-V6, §3.2): a `RequestLogRecord`
+with its outcome, `blocked_by`, layer results, `target_called`, `cache_hit`,
+`model_id`, egress variant and action, and the reasoning finding labels; or,
+in a shadow mode, a `ShadowRecord` (IP-4).
 
 `GET /healthz` (liveness) and `GET /readyz` (readiness: settings loaded and the
 telemetry sink healthy) are [Project Decision] operational probes that return
@@ -29,7 +30,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from starlette.responses import JSONResponse, Response
 
-from app.audit import record_refusal, record_request
+from app.audit import record_refusal, record_request, record_shadow
 from app.errors import uniform_refusal_response
 from app.inspection import prompt_hash
 from app.pipeline import GatewayRuntime, run_chat
@@ -76,6 +77,13 @@ async def chat(payload: GatewayRequest, request: Request) -> Response:
     if not isinstance(runtime, GatewayRuntime):
         raise RuntimeError("gateway runtime is not initialized")  # uniform 503 via the global handler
     result = await run_chat(runtime, payload)
+    if result.shadow is not None:
+        record_shadow(app, request.scope, **vars(result.shadow))
+        if result.content is None:
+            return uniform_refusal_response()
+        return JSONResponse(GatewayResponse(content=result.content).model_dump())
+    if result.outcome is None:
+        raise RuntimeError("pipeline returned neither an outcome nor a shadow record")  # uniform 503
     record_request(
         app,
         request.scope,

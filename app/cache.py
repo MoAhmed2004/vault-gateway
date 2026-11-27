@@ -9,7 +9,10 @@ Three caches, keyed only by the frozen builders in `contracts.cache_keys`:
   (`egress_verdict_key`). The frozen key carries no L4 version, so each row
   also stores the `l4_version` that produced it and a lookup under a
   different version is a miss [Project Decision, extends IP-5: a Presidio or
-  rule change must never replay a stale egress decision].
+  rule change must never replay a stale egress decision]. A write under a
+  new `l4_version` replaces the stale row (upsert, Step 5B.1, closes Step 5A
+  L4), so a version bump never leaves a key as a permanent miss; a write
+  under the same version keeps the first row.
 - `target_responses`: the full raw provider JSON, `reasoning` included
   (`target_response_key`: model ID, parameters, full message list).
 
@@ -18,9 +21,12 @@ with `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`. Every
 statement runs on one dedicated thread that owns the only connection, fed by
 the executor's in-memory FIFO queue, so there is exactly one writer and a read
 submitted after a write always sees it. Writes are not awaited by the request
-path; `flush()` waits for every queued write. Rows are written with
-`INSERT OR IGNORE`, so the first value stored under a key is kept and replays
-are deterministic. `writes_enabled=False` bypasses every write (E4, IP-8).
+path; `flush()` waits for every queued write. Layer-verdict and response rows
+are written with `INSERT OR IGNORE`, so the first value stored under a key is
+kept and replays are deterministic; egress rows are kept the same way within
+one `l4_version` and replaced across versions. `writes_enabled=False`
+bypasses every write. E4 runs with `CACHE_ENABLED=false` (no reads either, so
+every request runs every layer under load, TM-R5, IP-8).
 
 Schema setup mirrors `telemetry/writer.py` without importing it (package
 boundaries, §5.2): one `BEGIN IMMEDIATE ... COMMIT` transaction creates the
@@ -306,9 +312,12 @@ class VerdictCache:
         return json.loads(row[1]) if hit else None
 
     def put_egress(self, key: str, l4_version: str, payload: Mapping[str, Any]) -> None:
+        """Store one egress decision; a row left by another L4 version is replaced, one of this version is kept."""
         self._write(
             "egress_verdicts",
-            "INSERT OR IGNORE INTO egress_verdicts (cache_key, l4_version, payload, created_utc) VALUES (?, ?, ?, ?)",
+            "INSERT INTO egress_verdicts (cache_key, l4_version, payload, created_utc) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET l4_version = excluded.l4_version, payload = excluded.payload, "
+            "created_utc = excluded.created_utc WHERE egress_verdicts.l4_version != excluded.l4_version",
             (key, l4_version, _dumps(dict(payload)), _now()),
         )
 

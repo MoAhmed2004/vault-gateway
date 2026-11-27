@@ -18,7 +18,9 @@ settings live in one place.
   phase, and an outer `asyncio.wait_for` bounds the whole call to `timeout_s`.
   TM-R2 budgets exclude target LLM time, so this timeout is separate from them.
 - Failures: a timeout, transport error, non-2xx status (429 rate limit, 5xx,
-  4xx), malformed JSON, or a body without a usable assistant message raises
+  4xx), malformed JSON (including the non-standard constants `NaN`,
+  `Infinity` and `-Infinity`, which Python's `json` would otherwise accept,
+  Step 5B.1 LM-1), or a body without a usable assistant message raises
   `UpstreamError` with a short `kind` label. The gateway maps every kind to
   the uniform 503 logged as `Error` / `upstream_error`. No message carries
   the API key, a request body or a response body.
@@ -32,6 +34,7 @@ network.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
@@ -55,6 +58,19 @@ class UpstreamError(Exception):
 
 class ModelCheckError(RuntimeError):
     """Startup model check failed (§2.7, §3.9): the gateway must not start."""
+
+
+def _reject_non_finite(token: str) -> Any:
+    """`json.loads` hook for `NaN`, `Infinity` and `-Infinity`: refuse them (RFC 8259 has no such values)."""
+    raise ValueError(f"non-standard JSON constant {token}")
+
+
+def parse_provider_json(body: bytes) -> Any:
+    """Strict JSON parse of a provider body. Raises ValueError on malformed JSON or a non-finite constant."""
+    try:
+        return json.loads(body, parse_constant=_reject_non_finite)
+    except RecursionError:
+        raise ValueError("provider JSON nests too deeply") from None
 
 
 def _message(raw: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -135,8 +151,8 @@ class GroqClient:
         if not 200 <= response.status_code < 300:
             raise UpstreamError(f"http_{response.status_code}")
         try:
-            body = response.json()
-        except ValueError:
+            body = parse_provider_json(response.content)
+        except ValueError:  # JSONDecodeError, UnicodeDecodeError and NaN / Infinity are all ValueError
             raise UpstreamError("bad_json") from None
         if not isinstance(body, dict):
             raise UpstreamError("bad_json")

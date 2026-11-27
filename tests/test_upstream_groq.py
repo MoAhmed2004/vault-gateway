@@ -240,3 +240,34 @@ def test_settings_for_the_upstream(tmp_path):
         Settings(**base, ALLOW_MODEL_FAILOVER=True)
     with pytest.raises(ValueError):
         Settings(**base, UPSTREAM_TIMEOUT_S=0)
+
+
+# Non-standard JSON constants (TM-R6, RT-V6; Step 5B.1 LM-1, closes Step 5A LM1)
+
+NAN_BODY = (
+    b'{"id": "x", "model": "openai/gpt-oss-20b", "usage": {"queue_time": NaN}, '
+    b'"choices": [{"message": {"role": "assistant", "content": "Paris."}}]}'
+)
+
+
+@pytest.mark.parametrize("constant", [b"NaN", b"Infinity", b"-Infinity"])
+def test_non_finite_json_constants_are_bad_json(constant):
+    fake = FakeGroq(raw_body=NAN_BODY.replace(b"NaN", constant))
+    with pytest.raises(UpstreamError) as info:
+        run(_with(fake.client(), lambda c: c.complete(MESSAGES)))
+    assert info.value.kind == "bad_json"
+    assert len(fake.chat_requests) == 1  # refused, never retried
+
+
+def test_finite_json_with_the_same_shape_is_accepted():
+    fake = FakeGroq(raw_body=NAN_BODY.replace(b"NaN", b"0.25"))
+    raw = run(_with(fake.client(), lambda c: c.complete(MESSAGES)))
+    assert raw["usage"]["queue_time"] == 0.25 and response_fields(raw) == ("Paris.", None)
+
+
+@pytest.mark.parametrize("body", [b"\xff\xfe not utf-8", b"[" * 100_000 + b"]" * 100_000], ids=["not-utf8", "deep-nesting"])
+def test_undecodable_or_deeply_nested_json_is_bad_json(body):
+    fake = FakeGroq(raw_body=body)
+    with pytest.raises(UpstreamError) as info:
+        run(_with(fake.client(), lambda c: c.complete(MESSAGES)))
+    assert info.value.kind == "bad_json"

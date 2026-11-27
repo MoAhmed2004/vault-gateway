@@ -29,8 +29,11 @@ from contracts.paths import synced_folder_component
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOG_DB_PATH = REPO_ROOT / "data" / "logs" / "vault.db"
 DEFAULT_CACHE_DB_PATH = REPO_ROOT / "data" / "cache" / "vault_cache.db"
+DEFAULT_CHROMA_DB_PATH = REPO_ROOT / "data" / "chroma_db"
+DEFAULT_MINILM_MODEL_DIR = REPO_ROOT / "models" / "minilm"
+DEFAULT_L3_MODEL_DIR = REPO_ROOT / "models" / "deberta"
 DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-STEP_5B_EGRESS_VARIANTS = frozenset({"X3"})
+SHADOW_MODES = frozenset({"shadow_ingress_only", "shadow_full_e2e"})
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 
 DEFAULT_HMAC_SECRET = "vault_dev_secret_change_me"
@@ -111,10 +114,30 @@ class Settings(BaseSettings):
     TARGET_SEED: int = 0
     TARGET_REASONING_EFFORT: ReasoningEffortName | None = None
 
-    # Egress (IP-6): X0 none, X1 Presidio, X2 Presidio + exact canary; X3 needs the Step 5B similarity check
+    # Egress (IP-6, §2.1): X0 none, X1 Presidio, X2 + exact canary and planted PII, X3 + decoded-text and leak check
     EGRESS_VARIANT: EgressVariantName = "X2"
+    # X3 leak check thresholds: the O1 oracle defaults (§3.1) [Project Decision, extends IP-6]
+    X3_SIMILARITY_THRESHOLD: float = Field(default=0.80, ge=-1.0, le=1.0, allow_inf_nan=False)
+    X3_NGRAM_OVERLAP_THRESHOLD: float = Field(default=0.30, gt=0.0, le=1.0, allow_inf_nan=False)
+    X3_NGRAM_SIZE: PositiveInt = 3
 
-    # Caches (IP-5, IP-8: local disk only, cache writes bypassed during E4)
+    # Ingress layers L2 (ChromaDB + MiniLM) and L3 (DeBERTa ONNX); artifacts from scripts/fetch_models.py
+    L2_ENABLED: bool = True
+    L3_ENABLED: bool = True
+    MINILM_MODEL_DIR: Path = DEFAULT_MINILM_MODEL_DIR
+    L3_MODEL_DIR: Path = DEFAULT_L3_MODEL_DIR
+    L3_MALICIOUS_LABEL: str = "INJECTION"
+    CHROMA_DB_PATH: Path = DEFAULT_CHROMA_DB_PATH
+    # Thresholds are defaults until tuned on the validation split (§2.4, §4)
+    L2_THRESHOLD: float = Field(default=0.80, ge=-1.0, le=1.0, allow_inf_nan=False)
+    L3_THRESHOLD: float = Field(default=0.50, gt=0.0, le=1.0, allow_inf_nan=False)
+
+    # Bounded layer pool (IP-7): 0 workers means one per physical core
+    LAYER_POOL_WORKERS: int = Field(default=0, ge=0)
+    LAYER_POOL_QUEUE_LIMIT: int = Field(default=32, ge=0)
+
+    # Caches (IP-5, IP-8: local disk only). E4 runs with CACHE_ENABLED=false (no cache reads or writes,
+    # TM-R5); shadow_full_e2e needs both flags on (IP-4 oracle join through the egress cache).
     CACHE_DB_PATH: Path = DEFAULT_CACHE_DB_PATH
     CACHE_ENABLED: bool = True
     CACHE_WRITES_ENABLED: bool = True
@@ -190,7 +213,7 @@ class Settings(BaseSettings):
             raise ValueError("ALLOW_MODEL_FAILOVER must be false: runtime failover would mix models mid-experiment (§2.7, §3.9)")
         return value
 
-    @field_validator("LOG_DB_PATH", "CACHE_DB_PATH")
+    @field_validator("LOG_DB_PATH", "CACHE_DB_PATH", "CHROMA_DB_PATH", "MINILM_MODEL_DIR", "L3_MODEL_DIR")
     @classmethod
     def _anchor_log_path(cls, value: Path) -> Path:
         path = value.expanduser()
@@ -200,15 +223,6 @@ class Settings(BaseSettings):
     @classmethod
     def _blank_effort_is_none(cls, value: Any) -> Any:
         return None if isinstance(value, str) and not value.strip() else value
-
-    @field_validator("EGRESS_VARIANT")
-    @classmethod
-    def _variant_is_implemented(cls, value: str) -> str:
-        if value in STEP_5B_EGRESS_VARIANTS:
-            raise ValueError(
-                "EGRESS_VARIANT=X3 needs the decoded-text and similarity leak check (§2.1), planned for Step 5B"
-            )
-        return value
 
     @field_validator("OBJECTIVE_ID")
     @classmethod
@@ -236,10 +250,18 @@ class Settings(BaseSettings):
                 )
         if self.UPSTREAM_MODE == "groq" and is_placeholder_api_key(self.GROQ_API_KEY):
             raise ValueError("GROQ_API_KEY is a placeholder value; set a real key or leave it blank")
-        for name, path in (("LOG_DB_PATH", self.LOG_DB_PATH), ("CACHE_DB_PATH", self.CACHE_DB_PATH)):
+        stores = (("LOG_DB_PATH", self.LOG_DB_PATH), ("CACHE_DB_PATH", self.CACHE_DB_PATH), ("CHROMA_DB_PATH", self.CHROMA_DB_PATH))
+        for name, path in stores:
             offender = synced_folder_component(path.resolve())
             if offender is not None:
                 raise ValueError(f"{name} must be on local disk, not a synced folder (IP-8): component {offender!r}")
+        if self.GATEWAY_MODE in SHADOW_MODES and not (self.L2_ENABLED and self.L3_ENABLED):
+            raise ValueError(f"{self.GATEWAY_MODE} runs L1, L2 and L3 on every item (IP-4); enable L2 and L3")
+        if self.GATEWAY_MODE == "shadow_full_e2e" and not (self.CACHE_ENABLED and self.CACHE_WRITES_ENABLED):
+            raise ValueError(
+                "shadow_full_e2e writes X0 to X3 to the IP-5 egress cache for the harness oracle join (IP-4, IP-5); "
+                "set CACHE_ENABLED=true and CACHE_WRITES_ENABLED=true"
+            )
         layer_sum = self.L1_BUDGET_MS + self.L2_BUDGET_MS + self.L3_BUDGET_MS + self.L4_BUDGET_MS
         if layer_sum > self.TOTAL_BUDGET_MS:
             raise ValueError(

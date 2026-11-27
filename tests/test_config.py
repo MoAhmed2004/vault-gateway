@@ -219,6 +219,56 @@ def test_invalid_values_rejected(field, value):
         make(**{field: value})
 
 
+def test_step_5b_defaults():
+    s = make()
+    assert (s.L2_ENABLED, s.L3_ENABLED) == (True, True)
+    assert s.MINILM_MODEL_DIR == REPO_ROOT / "models" / "minilm" and s.L3_MODEL_DIR == REPO_ROOT / "models" / "deberta"
+    assert s.CHROMA_DB_PATH == REPO_ROOT / "data" / "chroma_db"
+    assert (s.L2_THRESHOLD, s.L3_THRESHOLD, s.L3_MALICIOUS_LABEL) == (0.80, 0.50, "INJECTION")
+    assert (s.X3_SIMILARITY_THRESHOLD, s.X3_NGRAM_OVERLAP_THRESHOLD, s.X3_NGRAM_SIZE) == (0.80, 0.30, 3)
+    assert (s.LAYER_POOL_WORKERS, s.LAYER_POOL_QUEUE_LIMIT) == (0, 32)
+    assert make(EGRESS_VARIANT="X3").EGRESS_VARIANT == "X3"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("L2_THRESHOLD", 1.5),
+        ("L3_THRESHOLD", 0.0),
+        ("X3_SIMILARITY_THRESHOLD", float("nan")),
+        ("X3_NGRAM_OVERLAP_THRESHOLD", 0.0),
+        ("X3_NGRAM_SIZE", 0),
+        ("LAYER_POOL_WORKERS", -1),
+        ("LAYER_POOL_QUEUE_LIMIT", -1),
+    ],
+)
+def test_invalid_step_5b_values_rejected(field, value):
+    with pytest.raises(ValidationError):
+        make(**{field: value})
+
+
+def test_synced_folder_chroma_path_rejected():
+    with pytest.raises(ValidationError, match="CHROMA_DB_PATH"):
+        make(CHROMA_DB_PATH="C:/Users/x/OneDrive/chroma_db")
+
+
+@pytest.mark.parametrize("mode", ["shadow_ingress_only", "shadow_full_e2e"])
+@pytest.mark.parametrize("disabled", ["L2_ENABLED", "L3_ENABLED"])
+def test_shadow_modes_require_l2_and_l3(mode, disabled):
+    with pytest.raises(ValidationError, match="IP-4"):
+        make(GATEWAY_MODE=mode, HMAC_SECRET="real-secret-at-least-16", **{disabled: False})
+
+
+@pytest.mark.parametrize("flag", ["CACHE_ENABLED", "CACHE_WRITES_ENABLED"])
+def test_shadow_full_e2e_requires_active_cache_writes(flag):
+    """IP-4, IP-5 (LM-4): X0 to X3 are written to the egress cache so the harness can join oracles offline."""
+    with pytest.raises(ValidationError, match="oracle join"):
+        make(GATEWAY_MODE="shadow_full_e2e", HMAC_SECRET="real-secret-at-least-16", **{flag: False})
+    # The other tiers may run without the cache (E4 uses CACHE_ENABLED=false).
+    assert make(GATEWAY_MODE="shadow_ingress_only", HMAC_SECRET="real-secret-at-least-16", **{flag: False})
+    assert make(GATEWAY_MODE="eval", HMAC_SECRET="real-secret-at-least-16", **{flag: False})
+
+
 @pytest.mark.parametrize("mode", ["production", "demo", "eval", "shadow_ingress_only", "shadow_full_e2e"])
 def test_all_modes_valid(mode):
     assert make(GATEWAY_MODE=mode, HMAC_SECRET="real-secret-at-least-16").GATEWAY_MODE == mode

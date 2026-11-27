@@ -22,3 +22,7 @@ chroma_db/
 # Experiment runs and trial logs; may contain harmful completions (§2.7, §3.8). Never commit.
 results/
 data/logs/
+
+# Local model artifacts fetched by scripts/fetch_models.py (§5.3); hashes are in docs/artifacts.md.
+# Root only: a source package such as app/models/ or harness/models/ stays tracked.
+/models/

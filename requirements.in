@@ -8,5 +8,10 @@ python-dotenv
 faker==30.1.0
 phonenumbers
 presidio-analyzer
+# Step 5B: L2 threat memory (ChromaDB, MiniLM ONNX), L3 classifier (DeBERTa ONNX), IP-7 pool sizing
+chromadb
+onnxruntime
+tokenizers
+psutil
 pytest
 pytest-asyncio
