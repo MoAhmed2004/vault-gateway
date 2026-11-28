@@ -14,9 +14,12 @@ replayed to the application unchanged. Exactly `max_body_bytes` is accepted;
 one byte more is refused.
 
 `FailClosedMiddleware` (TM-R6): the outermost middleware registered by the
-gateway. It records the start time and `X-Trial-ID` (server-side only) and
-turns any exception raised below it into the uniform 503 when the response
-has not started yet, so a fault never reaches a default error page.
+gateway when rate limiting is off; with `ENABLE_RATE_LIMITING=true` the
+TM-R7 limiter (`app/rate_limit.py`) sits outside it. It records the start
+time, `X-Trial-ID` (server-side only) and the request id unless the limiter
+already did, and turns any exception raised below it into the uniform 503
+when the response has not started yet, so a fault never reaches a default
+error page.
 
 Starlette itself always wraps the user middleware stack in its own
 `ServerErrorMiddleware`, so that class sits outside `FailClosedMiddleware`.
@@ -33,11 +36,10 @@ Out of scope for TM-R6: uvicorn answers a request it cannot parse as HTTP
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
-from app.audit import STATE_STARTED, STATE_TRIAL_ID, parse_trial_id, scope_state
+from app.audit import request_context
 from app.errors import send_uniform_refusal
 
 logger = logging.getLogger("vault.gateway")
@@ -146,9 +148,7 @@ class FailClosedMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        state = scope_state(scope)
-        state[STATE_STARTED] = time.perf_counter()
-        state[STATE_TRIAL_ID] = parse_trial_id(scope.get("headers", []))
+        request_context(scope)  # start time, X-Trial-ID, request_id; kept when the TM-R7 limiter set them first
         started = False
 
         async def tracking_send(message: Message) -> None:

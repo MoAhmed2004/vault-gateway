@@ -265,12 +265,20 @@ class _CountingSink:
         self.records.append(record)
 
 
+def gateway_settings(chroma: Path, log_db: Path) -> Settings:
+    """Benchmark settings. TM-R7: rate limiting MUST be off in every latency and throughput measurement (it would
+    refuse request 31 and distort the numbers). IP-10 stays off too (the production default), so L4 is X0 to X3 only.
+    """
+    return Settings(
+        _env_file=None, GATEWAY_MODE="production", UPSTREAM_MODE="groq", GROQ_API_KEY="latency-check-local-key",
+        CACHE_ENABLED=False, CHROMA_DB_PATH=chroma, LOG_DB_PATH=log_db,
+        ENABLE_RATE_LIMITING=False, ENABLE_OUTPUT_SANITIZER=False,
+    )
+
+
 def measure_gateway(repeats: int, chroma: Path, embedder, classifier, store) -> None:
     scratch = Path(tempfile.mkdtemp(prefix="vault-latency-"))
-    settings = Settings(
-        _env_file=None, GATEWAY_MODE="production", UPSTREAM_MODE="groq", GROQ_API_KEY="latency-check-local-key",
-        CACHE_ENABLED=False, CHROMA_DB_PATH=chroma, LOG_DB_PATH=scratch / "vault.db",
-    )
+    settings = gateway_settings(chroma, scratch / "vault.db")
     sink = _CountingSink()
     app = create_app(settings, sink, upstream=instant_upstream(), embedder=embedder, classifier=classifier, store=store)
     print(f"\nGateway overhead (POST /v1/chat, defaults: budgets L1/L2/L3/L4 = "

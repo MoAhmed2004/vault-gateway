@@ -11,22 +11,35 @@ Accounting invariant: for every submitted record,
 increment `failed_count`, and queued records abandoned on an unexpected writer
 thread death are counted in `lost_count`.
 
+Tables (`SCHEMA_VERSION = 2` since Step 5C): `request_logs` and
+`shadow_records` (the frozen W2 records), plus `rate_limit_logs` (TM-R7
+refusals, reason `rate_limit`) and `output_sanitizer_logs` (IP-10 verdicts,
+apart from every X0 to X3 egress verdict). The two Step 5C rows arrive as
+plain mappings (`record_rate_limit`, `record_output_sanitizer`) and are
+validated field by field before they are counted, on the same queue and
+writer thread, so the accounting invariant covers them too.
+
 Imports only stdlib and `contracts`.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import queue
 import sqlite3
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from contracts import RequestLogRecord, ShadowRecord
+from contracts.modes import ALL_GATEWAY_MODES
 from contracts.paths import synced_folder_component
 
-SCHEMA_VERSION = 1
+# 1: request_logs and shadow_records (W2 freeze). 2: adds rate_limit_logs (TM-R7) and output_sanitizer_logs
+# (IP-10) at Step 5C; the two frozen tables are unchanged. A version-1 file is refused, never migrated.
+SCHEMA_VERSION = 2
 DEFAULT_QUEUE_MAXSIZE = 10000
 _BATCH_LIMIT = 200
 
@@ -95,7 +108,68 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_shadow_records_trial ON shadow_records (trial_id)",
     "CREATE INDEX IF NOT EXISTS idx_shadow_records_prompt ON shadow_records (prompt_hash)",
+    # Schema version 2 (Step 5C): TM-R7 rate-limit refusals and IP-10 output-sanitizer verdicts, each in its own
+    # table because neither fits the frozen RequestLogRecord (`rate_limit` is not a BlockedBy value, and the
+    # sanitizer verdict must stay apart from the X0 to X3 egress verdicts).
+    """
+    CREATE TABLE IF NOT EXISTS rate_limit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp_utc TEXT NOT NULL,
+        gateway_mode TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        key_kind TEXT NOT NULL,
+        client_key_hash TEXT NOT NULL,
+        rate_limit_rpm INTEGER NOT NULL,
+        target_called INTEGER NOT NULL,
+        method TEXT,
+        path TEXT,
+        trial_id TEXT,
+        total_latency_ms REAL NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_rate_limit_logs_trial ON rate_limit_logs (trial_id)",
+    """
+    CREATE TABLE IF NOT EXISTS output_sanitizer_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp_utc TEXT NOT NULL,
+        gateway_mode TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        trial_id TEXT,
+        prompt_hash TEXT NOT NULL,
+        response_hash TEXT NOT NULL,
+        egress_variant TEXT NOT NULL,
+        sanitizer_version TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        matched_families TEXT NOT NULL,
+        latency_ms REAL NOT NULL,
+        error_message TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_output_sanitizer_logs_prompt ON output_sanitizer_logs (prompt_hash)",
 )
+
+# Server-side-only record layouts for the two Step 5C tables. `app/` builds them as plain mappings (it never
+# imports `telemetry/`), and the sink validates every field on the producer thread before enqueueing.
+RATE_LIMIT_COLUMNS = (
+    "timestamp_utc", "gateway_mode", "reason", "request_id", "key_kind", "client_key_hash", "rate_limit_rpm",
+    "target_called", "method", "path", "trial_id", "total_latency_ms",
+)
+OUTPUT_SANITIZER_COLUMNS = (
+    "timestamp_utc", "gateway_mode", "request_id", "trial_id", "prompt_hash", "response_hash", "egress_variant",
+    "sanitizer_version", "mode", "verdict", "matched_families", "latency_ms", "error_message",
+)
+_OUTPUT_SANITIZER_JSON = ("matched_families",)
+RATE_LIMIT_REASON = "rate_limit"
+RATE_LIMIT_KEY_KINDS = frozenset({"ip", "session", "anonymous"})
+SANITIZER_MODES = frozenset({"block", "neutralize"})
+SANITIZER_VERDICTS = frozenset({"allow", "block", "neutralized", "timeout", "error"})
+SANITIZER_FAMILIES = frozenset({"xss", "image_exfil", "sqli_cmdi"})
+SANITIZER_VARIANTS = frozenset({"X1", "X2", "X3"})
+_MAX_TEXT_FIELD = 512
+_SHA256 = frozenset("0123456789abcdef")
+_REQUEST_ID_HEX = 32
 
 
 def _dump_json(value: Any) -> str:
@@ -144,6 +218,87 @@ def _shadow_row(record: ShadowRecord) -> tuple[Any, ...]:
     return tuple(values)
 
 
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and set(value) <= _SHA256
+
+
+def _is_request_id(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == _REQUEST_ID_HEX and set(value) <= _SHA256
+
+
+def _optional_text(value: Any, name: str) -> str | None:
+    _require(value is None or isinstance(value, str), f"{name} must be a string or None")
+    return None if value is None else _text(value[:_MAX_TEXT_FIELD])
+
+
+def _finite_ms(value: Any, name: str) -> float:
+    _require(isinstance(value, (int, float)) and not isinstance(value, bool), f"{name} must be a number")
+    number = float(value)
+    _require(math.isfinite(number) and number >= 0.0, f"{name} must be finite and non-negative")
+    return number
+
+
+def _exact_keys(record: Mapping[str, Any], columns: tuple[str, ...], kind: str) -> None:
+    if not isinstance(record, Mapping):
+        raise TypeError(f"{kind} record must be a mapping")
+    keys = set(record)
+    _require(keys == set(columns), f"{kind} record fields differ: missing {sorted(set(columns) - keys)}, "
+             f"unexpected {sorted(keys - set(columns))}")
+
+
+def rate_limit_row(record: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Validated `rate_limit_logs` row (TM-R7). Raises TypeError or ValueError on any bad field."""
+    _exact_keys(record, RATE_LIMIT_COLUMNS, "rate_limit")
+    _require(isinstance(record["timestamp_utc"], str) and bool(record["timestamp_utc"]), "timestamp_utc is required")
+    _require(record["gateway_mode"] in ALL_GATEWAY_MODES, "gateway_mode must be a canonical gateway mode")
+    _require(record["reason"] == RATE_LIMIT_REASON, "reason must be 'rate_limit'")
+    _require(_is_request_id(record["request_id"]), "request_id must be 32 lowercase hex characters")
+    _require(record["key_kind"] in RATE_LIMIT_KEY_KINDS, "key_kind must be ip, session or anonymous")
+    _require(_is_sha256(record["client_key_hash"]), "client_key_hash must be a SHA-256 hex digest")
+    rpm = record["rate_limit_rpm"]
+    _require(isinstance(rpm, int) and not isinstance(rpm, bool) and rpm >= 1, "rate_limit_rpm must be an int >= 1")
+    _require(record["target_called"] is False, "a rate-limited request never reaches the target")
+    return (
+        record["timestamp_utc"], record["gateway_mode"], RATE_LIMIT_REASON, record["request_id"], record["key_kind"],
+        record["client_key_hash"], rpm, 0, _optional_text(record["method"], "method"),
+        _optional_text(record["path"], "path"), _optional_text(record["trial_id"], "trial_id"),
+        _finite_ms(record["total_latency_ms"], "total_latency_ms"),
+    )
+
+
+def output_sanitizer_row(record: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Validated `output_sanitizer_logs` row (IP-10). Raises TypeError or ValueError on any bad field."""
+    _exact_keys(record, OUTPUT_SANITIZER_COLUMNS, "output_sanitizer")
+    _require(isinstance(record["timestamp_utc"], str) and bool(record["timestamp_utc"]), "timestamp_utc is required")
+    _require(record["gateway_mode"] in ALL_GATEWAY_MODES, "gateway_mode must be a canonical gateway mode")
+    _require(_is_request_id(record["request_id"]), "request_id must be 32 lowercase hex characters")
+    _require(_is_sha256(record["prompt_hash"]), "prompt_hash must be a SHA-256 hex digest")
+    _require(_is_sha256(record["response_hash"]), "response_hash must be a SHA-256 hex digest")
+    _require(record["egress_variant"] in SANITIZER_VARIANTS, "egress_variant must be X1, X2 or X3")
+    version = record["sanitizer_version"]
+    _require(isinstance(version, str) and bool(version.strip()), "sanitizer_version is required")
+    _require(record["mode"] in SANITIZER_MODES, "mode must be block or neutralize")
+    _require(record["verdict"] in SANITIZER_VERDICTS, f"verdict must be one of {sorted(SANITIZER_VERDICTS)}")
+    families = record["matched_families"]
+    _require(isinstance(families, (tuple, list)) and all(f in SANITIZER_FAMILIES for f in families),
+             f"matched_families must list families from {sorted(SANITIZER_FAMILIES)}")
+    ordered = sorted(set(families))
+    _require(list(families) == ordered, "matched_families must be sorted and unique")
+    _require((record["verdict"] in ("block", "neutralized")) == bool(ordered),
+             "block and neutralized verdicts need matched families; the others must have none")
+    return (
+        record["timestamp_utc"], record["gateway_mode"], record["request_id"],
+        _optional_text(record["trial_id"], "trial_id"), record["prompt_hash"], record["response_hash"],
+        record["egress_variant"], _text(version), record["mode"], record["verdict"], _dump_json(ordered),
+        _finite_ms(record["latency_ms"], "latency_ms"), _optional_text(record["error_message"], "error_message"),
+    )
+
+
 def _insert_sql(table: str, columns: tuple[str, ...]) -> str:
     marks = ", ".join("?" for _ in columns)
     return f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({marks})"
@@ -151,6 +306,9 @@ def _insert_sql(table: str, columns: tuple[str, ...]) -> str:
 
 _REQUEST_SQL = _insert_sql("request_logs", REQUEST_COLUMNS)
 _SHADOW_SQL = _insert_sql("shadow_records", SHADOW_COLUMNS)
+_RATE_LIMIT_SQL = _insert_sql("rate_limit_logs", RATE_LIMIT_COLUMNS)
+_OUTPUT_SANITIZER_SQL = _insert_sql("output_sanitizer_logs", OUTPUT_SANITIZER_COLUMNS)
+_ROW_SQL = {"rate_limit": _RATE_LIMIT_SQL, "output_sanitizer": _OUTPUT_SANITIZER_SQL}
 
 
 class _Flush:
@@ -162,7 +320,7 @@ def _is_record_item(item: Any) -> bool:
     return item is not None and not isinstance(item, _Flush)
 
 
-MANAGED_TABLES: tuple[str, ...] = ("request_logs", "shadow_records")
+MANAGED_TABLES: tuple[str, ...] = ("request_logs", "shadow_records", "rate_limit_logs", "output_sanitizer_logs")
 
 # One `PRAGMA table_info` row reduced to the fields that define a column:
 # (name, declared type, NOT NULL flag, primary-key position).
@@ -435,8 +593,10 @@ class SQLiteTelemetrySink:
         try:
             if kind == "request":
                 conn.execute(_REQUEST_SQL, _request_row(record))
-            else:
+            elif kind == "shadow":
                 conn.execute(_SHADOW_SQL, _shadow_row(record))
+            else:  # a row validated by the producer (rate_limit, output_sanitizer)
+                conn.execute(_ROW_SQL[kind], record)
             self._batch_staged += 1
         except Exception:  # noqa: BLE001  a bad row must not kill the writer
             self._batch_failed += 1
@@ -463,6 +623,14 @@ class SQLiteTelemetrySink:
         if not isinstance(record, ShadowRecord):
             raise TypeError("record_shadow requires a ShadowRecord")
         self._enqueue(("shadow", record))
+
+    def record_rate_limit(self, record: Mapping[str, Any]) -> None:
+        """Record one TM-R7 rate-limit refusal. The fields are validated here, before the record is counted."""
+        self._enqueue(("rate_limit", rate_limit_row(record)))
+
+    def record_output_sanitizer(self, record: Mapping[str, Any]) -> None:
+        """Record one IP-10 output-sanitizer verdict (never an X0 to X3 egress verdict). Validated here."""
+        self._enqueue(("output_sanitizer", output_sanitizer_row(record)))
 
     # Counters and health
 
@@ -623,3 +791,11 @@ class SQLiteTelemetrySink:
     def fetch_shadows(self, limit: int | None = None) -> list[dict[str, Any]]:
         """Return stored shadow_records rows (JSON columns decoded), oldest first."""
         return self._read("shadow_records", _SHADOW_JSON, limit)
+
+    def fetch_rate_limits(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """Return stored rate_limit_logs rows, oldest first (TM-R7)."""
+        return self._read("rate_limit_logs", (), limit)
+
+    def fetch_output_sanitizer(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """Return stored output_sanitizer_logs rows (`matched_families` decoded), oldest first (IP-10)."""
+        return self._read("output_sanitizer_logs", _OUTPUT_SANITIZER_JSON, limit)

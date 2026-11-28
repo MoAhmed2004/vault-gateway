@@ -20,7 +20,8 @@ settings live in one place.
 - Failures: a timeout, transport error, non-2xx status (429 rate limit, 5xx,
   4xx), malformed JSON (including the non-standard constants `NaN`,
   `Infinity` and `-Infinity`, which Python's `json` would otherwise accept,
-  Step 5B.1 LM-1), or a body without a usable assistant message raises
+  Step 5B.1 LM-1, and numbers such as `1e999` that overflow to infinity,
+  Step 5C F1), or a body without a usable assistant message raises
   `UpstreamError` with a short `kind` label. The gateway maps every kind to
   the uniform 503 logged as `Error` / `upstream_error`. No message carries
   the API key, a request body or a response body.
@@ -36,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any
@@ -65,10 +67,27 @@ def _reject_non_finite(token: str) -> Any:
     raise ValueError(f"non-standard JSON constant {token}")
 
 
+def _finite_float(token: str) -> float:
+    """`json.loads` hook for every JSON number with a fraction or exponent: refuse an overflow to infinity.
+
+    RFC 8259 numbers such as `1e999` or `-1e400` are valid JSON text, but
+    `float()` turns them into `inf` and `-inf`, which no canonical hash, cache
+    row or log record accepts (Step 5C F1, TM-R6, IP-9, RT-V6).
+    """
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError("JSON number overflows to a non-finite float")
+    return value
+
+
 def parse_provider_json(body: bytes) -> Any:
-    """Strict JSON parse of a provider body. Raises ValueError on malformed JSON or a non-finite constant."""
+    """Strict JSON parse of a provider body.
+
+    Raises ValueError on malformed JSON, a non-finite constant (`NaN`,
+    `Infinity`, `-Infinity`) or a number that overflows to infinity (`1e999`).
+    """
     try:
-        return json.loads(body, parse_constant=_reject_non_finite)
+        return json.loads(body, parse_constant=_reject_non_finite, parse_float=_finite_float)
     except RecursionError:
         raise ValueError("provider JSON nests too deeply") from None
 

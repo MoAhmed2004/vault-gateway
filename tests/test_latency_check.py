@@ -47,6 +47,14 @@ def test_cap_prompts_refuse_to_measure_less_when_nothing_fits():
         latency_check.cap_prompts(InspectionConfig(max_windows_per_view=2))
 
 
+def test_the_benchmark_runs_with_rate_limiting_and_the_output_sanitizer_off(tmp_path):
+    """TM-R7: ENABLE_RATE_LIMITING MUST be false in every latency or throughput run; IP-10 is off in it too."""
+    s = latency_check.gateway_settings(tmp_path / "chroma_db", tmp_path / "vault.db")
+    assert (s.GATEWAY_MODE, s.ENABLE_RATE_LIMITING, s.ENABLE_OUTPUT_SANITIZER, s.CACHE_ENABLED) == (
+        "production", False, False, False
+    )
+
+
 def test_budget_violations_use_the_configured_tm_r2_defaults():
     s = Settings(_env_file=None)
     budgets = {"L1": s.L1_BUDGET_MS, "L2": s.L2_BUDGET_MS, "L3": s.L3_BUDGET_MS, "L4": s.L4_BUDGET_MS}

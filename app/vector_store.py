@@ -39,6 +39,14 @@ Development seed (§2.4): a version labelled `bootstrap` (built from
 `data/l2_seed/bootstrap.jsonl`) is development and demo data only.
 `lineage()` returns a version and every parent, so startup can refuse a
 deterministic mode whose active version is, or descends from, `bootstrap`.
+The label alone is not enough (Step 5C F2): `source_tokens()` reads every
+record's comma-separated `source` metadata, so a version built from
+`bootstrap.jsonl` under another label (for example `s1_train`) is refused too.
+Metadata alone is not enough either (Step 5C.1 L-3): `documents()` returns
+every stored window text, and startup compares the SHA-256 of each
+`canonical_text` (and, for windows of a longer seed text, containment of the
+canonical text) with the seed file itself, so a copy of the seed with its `source`
+rewritten or removed is refused as well.
 
 Thread safety: queries run concurrently on layer-pool threads; version builds
 and activations are serialized by one lock, and matrix loads by another.
@@ -51,6 +59,7 @@ import json
 import logging
 import os
 import threading
+import unicodedata
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -73,6 +82,11 @@ _SHA256_HEX = frozenset("0123456789abcdef")
 
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def canonical_text(text: str) -> str:
+    """NFKC, casefolded, whitespace collapsed to single spaces and stripped (Step 5C.1 L-3 seed comparison form)."""
+    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
 
 
 def _embedding_digest(vector: np.ndarray) -> str:
@@ -161,6 +175,20 @@ class CollectionVersion:
         if queries.shape[1] != matrix.shape[1]:
             raise ValueError(f"query dimension {queries.shape[1]} differs from the stored dimension {matrix.shape[1]}")
         return [float(value) for value in np.max(normalize_rows(queries) @ matrix.T, axis=1)]
+
+    def documents(self) -> list[str]:
+        """Every record's stored window text (Step 5C.1 L-3: the bootstrap guard compares text, not only metadata)."""
+        got = self._collection.get(include=["documents"])
+        return [text or "" for text in (got["documents"] or [])]
+
+    def source_tokens(self) -> frozenset[str]:
+        """Every token of every record's comma-separated `source` metadata, stripped and casefolded (Step 5C F2)."""
+        got = self._collection.get(include=["metadatas"])
+        tokens: set[str] = set()
+        for meta in got["metadatas"] or []:
+            source = str((meta or {}).get("source", ""))
+            tokens.update(part.strip().casefold() for part in source.split(",") if part.strip())
+        return frozenset(tokens)
 
     def records(self) -> list[ThreatRecord]:
         """Every record of this version (used to build the next version)."""

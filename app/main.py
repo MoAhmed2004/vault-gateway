@@ -59,8 +59,14 @@ upstream client, store and pool it uses.
 Middleware order, outermost first: Starlette's own `ServerErrorMiddleware`
 (always added by Starlette, outside every user middleware; its handler is the
 registered global `Exception` handler, so it also answers with the uniform
-503), `FailClosedMiddleware`, `BodyCapMiddleware`, then FastAPI's exception
-middleware and router. Trailing-slash redirects are disabled
+503), `RateLimitMiddleware` (TM-R7, registered only when
+`ENABLE_RATE_LIMITING` is true: it refuses an over-limit client before a
+single body byte is read and catches its own faults), `FailClosedMiddleware`,
+`BodyCapMiddleware`, then FastAPI's exception middleware and router.
+
+The IP-10 output sanitizer (`app/layers/output_sanitizer.py`) is built only
+when `ENABLE_OUTPUT_SANITIZER` is true (demo by default) and runs inside the
+pipeline after L4. Trailing-slash redirects are disabled
 (`redirect_slashes=False`) so a path such as `/v1/chat/` is a routing miss
 with the uniform 503, not a 307 (TM-R6).
 """
@@ -68,18 +74,21 @@ with the uniform 503, not a 307 (TM-R6).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import logging
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
 
-from app.audit import record_refusal
+from app.audit import record_rate_limit, record_refusal
 from app.cache import VerdictCache
-from app.config import SHADOW_MODES, Settings, load_settings
+from app.config import REPO_ROOT, SHADOW_MODES, Settings, load_settings
 from app.errors import install_exception_handlers
 from app.executor import BoundedLayerPool
 from app.groq_client import GroqClient, target_parameters
@@ -89,12 +98,14 @@ from app.layers.l1_regex import L1RegexLayer
 from app.layers.l2_threat_memory import L2ThreatMemoryLayer
 from app.layers.l3_classifier import L3ClassifierLayer
 from app.layers.l4_egress import L4EgressScanner
+from app.layers.output_sanitizer import OutputSanitizer
 from app.middleware import BodyCapMiddleware, FailClosedMiddleware
 from app.onnx_models import Classifier, DebertaClassifier, Embedder, MiniLMEmbedder
 from app.pipeline import GatewayRuntime, default_ingress_layers
 from app.prompting import build_system_prompt
+from app.rate_limit import RateLimitMiddleware, TokenBucketLimiter
 from app.routes import router
-from app.vector_store import BOOTSTRAP_LABEL, ThreatMemoryStore
+from app.vector_store import BOOTSTRAP_LABEL, ThreatMemoryStore, canonical_text
 from contracts.inspection import InspectionBundle
 from contracts.modes import DETERMINISTIC_MODES
 from contracts.telemetry_sink import TelemetrySink
@@ -104,6 +115,10 @@ logger = logging.getLogger("vault.gateway")
 
 SHUTDOWN_FLUSH_TIMEOUT_S = 5.0
 WARM_UP_PROMPT = "warm-up prompt for the ingress rules"
+# The development seed (§2.4); deterministic modes refuse any L2 record whose text comes from it (Step 5C.1 L-3).
+BOOTSTRAP_SEED_PATH = REPO_ROOT / "data" / "l2_seed" / "bootstrap.jsonl"
+# A stored window this long that is a piece of a seed text is a window of that text, not a coincidence.
+MIN_SEED_FRAGMENT_CHARS = 32
 
 
 def build_groq_client(settings: Settings) -> GroqClient:
@@ -158,18 +173,81 @@ class _Models:
     owns_store: bool = False
 
 
-def refuse_dev_seed(settings: Settings, store: ThreatMemoryStore) -> None:
-    """Deterministic modes refuse an active L2 version that is, or descends from, the `bootstrap` dev seed (§2.4)."""
+@dataclass(frozen=True)
+class SeedFingerprint:
+    """The canonical texts (raw and decoded views) of the `bootstrap.jsonl` development seed and their hashes."""
+
+    texts: tuple[str, ...]
+    hashes: frozenset[str]
+
+    def matches(self, document: str) -> bool:
+        """True when a stored window is a seed text, or a long enough piece of one (a window of a longer text)."""
+        text = canonical_text(document)
+        if not text:
+            return False
+        if _sha256(text) in self.hashes:
+            return True
+        return len(text) >= MIN_SEED_FRAGMENT_CHARS and any(text in seed for seed in self.texts)
+
+
+def bootstrap_seed_fingerprint(path: Path = BOOTSTRAP_SEED_PATH) -> SeedFingerprint:
+    """Read the seed file (Step 5C.1 L-3); a missing file gives an empty fingerprint, a malformed one stops startup."""
+    if not path.is_file():
+        return SeedFingerprint((), frozenset())
+    texts: set[str] = set()
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            raise RuntimeError(f"{path}:{number}: each seed line needs a 'text' string")
+        views = [item["text"]]
+        bundle = build_inspection_bundle(item["text"], InspectionConfig())
+        if isinstance(bundle, InspectionBundle):
+            views.append(bundle.decoded_view)
+        texts.update(canonical for canonical in (canonical_text(view) for view in views) if canonical)
+    ordered = tuple(sorted(texts))
+    return SeedFingerprint(ordered, frozenset(_sha256(text) for text in ordered))
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def refuse_dev_seed(settings: Settings, store: ThreatMemoryStore, *, seed_path: Path = BOOTSTRAP_SEED_PATH) -> None:
+    """Deterministic modes refuse an active L2 version that holds or descends from the `bootstrap` dev seed (§2.4).
+
+    A version is refused when it, or any version in its parent chain, is
+    labelled `bootstrap`, holds a record whose comma-separated `source`
+    names `bootstrap` (Step 5C F2: `scripts/build_l2_collection.py` writes the
+    JSONL `source` values, so relabelling the seed cannot hide it), or holds
+    a record whose canonical text hash is the hash of a seed text (Step 5C.1
+    L-3: a copy of `bootstrap.jsonl` with `source` rewritten or removed).
+    """
     if settings.GATEWAY_MODE not in DETERMINISTIC_MODES:
         return
     active = store.active()
     if active is None:
         return
+    seed = bootstrap_seed_fingerprint(seed_path)
     for version in store.lineage(active):
         if version.label == BOOTSTRAP_LABEL:
             raise RuntimeError(
                 f"{settings.GATEWAY_MODE} refuses the L2 collection version {active.version[:12]}: it is or descends "
                 f"from the '{BOOTSTRAP_LABEL}' development seed (§2.4: measured runs populate L2 from S1-train only)"
+            )
+        if BOOTSTRAP_LABEL in version.source_tokens():
+            raise RuntimeError(
+                f"{settings.GATEWAY_MODE} refuses the L2 collection version {active.version[:12]}: version "
+                f"{version.version[:12]} (label {version.label!r}) holds records whose source is the "
+                f"'{BOOTSTRAP_LABEL}' development seed (§2.4: measured runs populate L2 from S1-train only)"
+            )
+        if seed.hashes and any(seed.matches(document) for document in version.documents()):
+            raise RuntimeError(
+                f"{settings.GATEWAY_MODE} refuses the L2 collection version {active.version[:12]}: version "
+                f"{version.version[:12]} (label {version.label!r}) holds records whose text matches the "
+                f"'{BOOTSTRAP_LABEL}' development seed {seed_path.name} (§2.4: measured runs populate L2 from "
+                "S1-train only)"
             )
 
 
@@ -261,8 +339,16 @@ def create_app(
     classifier: Classifier | None = None,
     store: ThreatMemoryStore | None = None,
     pool: BoundedLayerPool | None = None,
+    output_sanitizer: OutputSanitizer | None = None,
+    rate_limiter: TokenBucketLimiter | None = None,
 ) -> FastAPI:
-    """Build the gateway. `tokenizers` adds tokenizer limits for IP-2 sub-window splitting to the layers' own."""
+    """Build the gateway. `tokenizers` adds tokenizer limits for IP-2 sub-window splitting to the layers' own.
+
+    `output_sanitizer` and `rate_limiter` replace the built IP-10 sanitizer and
+    TM-R7 limiter (tests inject a failing sanitizer or a limiter on a fake
+    clock); they are used only when `ENABLE_OUTPUT_SANITIZER` and
+    `ENABLE_RATE_LIMITING` are true, so the flags stay authoritative.
+    """
     resolved = settings if settings is not None else load_settings()
     if not isinstance(resolved, Settings):
         raise TypeError("settings must be an app.config.Settings instance")
@@ -320,6 +406,11 @@ def create_app(
             register = getattr(scanner, "register_reference", None)
             if callable(register):
                 await asyncio.to_thread(register, prompt.manifest.manifest_id, prompt.system_prompt)
+            sanitizer = None
+            if resolved.ENABLE_OUTPUT_SANITIZER:  # IP-10; refused in eval and both shadow tiers by app.config
+                sanitizer = output_sanitizer if output_sanitizer is not None else OutputSanitizer(
+                    mode=resolved.OUTPUT_SANITIZER_MODE, image_allowlist=resolved.OUTPUT_IMAGE_ALLOWLIST
+                )
             app.state.runtime = GatewayRuntime(
                 settings=resolved,
                 inspection_config=inspection_config,
@@ -329,11 +420,15 @@ def create_app(
                 cache=cache,
                 upstream=client if calls_target else None,
                 pool=layer_pool,
+                output_sanitizer=sanitizer,
             )
             logger.info(
-                "gateway started: mode=%s upstream=%s egress=%s layers=%s pool=%d+%d", resolved.GATEWAY_MODE,
-                client.model if client is not None and calls_target else "none", resolved.EGRESS_VARIANT,
-                ",".join(layer.name for layer in layers if layer.enabled), layer_pool.workers, layer_pool.queue_limit,
+                "gateway started: mode=%s upstream=%s egress=%s layers=%s pool=%d+%d rate_limit=%s output_sanitizer=%s",
+                resolved.GATEWAY_MODE, client.model if client is not None and calls_target else "none",
+                resolved.EGRESS_VARIANT, ",".join(layer.name for layer in layers if layer.enabled), layer_pool.workers,
+                layer_pool.queue_limit,
+                f"{resolved.RATE_LIMIT_RPM}rpm/{resolved.RATE_LIMIT_KEY}" if resolved.ENABLE_RATE_LIMITING else "off",
+                f"{sanitizer.version}/{sanitizer.mode}" if sanitizer is not None else "off",
             )
             yield
         finally:
@@ -355,6 +450,7 @@ def create_app(
     app.state.inspection_config = None
     app.state.telemetry = None
     app.state.runtime = None
+    app.state.rate_limiter = None
 
     install_exception_handlers(app, lambda request, blocked_by: record_refusal(request.app, request.scope, blocked_by))
     app.include_router(router)
@@ -362,7 +458,19 @@ def create_app(
     def on_refusal(scope: Any, blocked_by: str) -> None:
         record_refusal(app, scope, blocked_by)
 
+    def on_rate_limit(scope: Any, key_kind: str, client_key_hash: str) -> None:
+        record_rate_limit(app, scope, key_kind=key_kind, client_key_hash=client_key_hash, rate_limit_rpm=resolved.RATE_LIMIT_RPM)
+
     # add_middleware inserts at the front, so the last call is the outermost layer.
     app.add_middleware(BodyCapMiddleware, max_body_bytes=resolved.MAX_REQUEST_BODY_BYTES, on_refusal=on_refusal)
     app.add_middleware(FailClosedMiddleware, on_refusal=on_refusal)
+    if resolved.ENABLE_RATE_LIMITING:  # TM-R7: outermost, before the body cap and any parsing
+        limiter = rate_limiter if rate_limiter is not None else TokenBucketLimiter(
+            resolved.RATE_LIMIT_RPM, max_clients=resolved.RATE_LIMIT_MAX_CLIENTS
+        )
+        app.state.rate_limiter = limiter
+        app.add_middleware(
+            RateLimitMiddleware, limiter=limiter, key_mode=resolved.RATE_LIMIT_KEY,
+            session_header=resolved.RATE_LIMIT_SESSION_HEADER, on_rate_limit=on_rate_limit, on_refusal=on_refusal,
+        )
     return app

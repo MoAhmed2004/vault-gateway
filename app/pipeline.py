@@ -34,6 +34,18 @@ Production and `eval` (IP-3):
 6. L4 egress (IP-6) in `EGRESS_VARIANT`, through the IP-5 egress cache. An L4
    timeout or error always fails closed (TM-R4): `Error` / `timeout` or
    `internal_error`, uniform 503.
+7. IP-10 output sanitizer, only when `ENABLE_OUTPUT_SANITIZER` is true (demo
+   by default; refused in `eval` and both shadow tiers): the released content
+   of the X1 to X3 decision is checked after the egress scan and before
+   release, on the pool, with the L4 budget left after the egress scan. A
+   match in `block` mode is `Egress-saved` / `blocked` / `L4` (uniform 503);
+   in `neutralize` mode the escaped content is released as `Egress-saved` /
+   `masked`; a timeout or error fails closed in both modes (TM-R4). The
+   request record carries the verdict as an `L4` result on the
+   `output_sanitizer` view, and the route logs a separate
+   `output_sanitizer_logs` row. The verdict and the neutralized text are
+   never written to the IP-5 egress cache, so the cached X0 to X3 decisions
+   are identical with the flag on or off.
 
 Post-target guard (TM-R6, RT-V6; Step 5B.1 LM-1): any unexpected exception
 after the target call returned (cache write, L4 bookkeeping, record building)
@@ -52,17 +64,17 @@ Shadow modes (IP-4), deterministic like `eval`:
 - `shadow_full_e2e`: L1, L2 and L3 all run with no short-circuit, the target
   (or its cache) is called for every item, and every egress variant X0 to X3
   is evaluated, cached in the IP-5 egress cache (X0 included) and logged
-  independently on the same response. The client-visible response is the one
-  the production cascade would release under the configured `EGRESS_VARIANT`
-  and `TIMEOUT_POLICY` [Project Decision, extends IP-4], so a shadow run never
-  shows more than production would.
+  independently on the same response. The public HTTP route releases nothing
+  (Step 5C F3): `POST /v1/chat` always answers with the uniform 503 in this
+  tier, so no response text ever leaves through the attacker-facing endpoint
+  during a measured run, whatever `EGRESS_VARIANT` says.
 - Oracle join (IP-4, Step 5B.1 LM-4): `harness/` fills
   `EgressVariantRecord.oracle_result` either in process, through
   `run_shadow_full_e2e_detail()` (each variant's client-visible output, its
   egress cache key and the shared `response_hash` and `manifest_id`), or
   offline, by rebuilding `egress_verdict_key(response_hash, manifest_id,
   variant)` from the logged `ShadowRecord` and reading the cached decision.
-  Variant outputs are never logged. The HTTP response is unchanged.
+  Variant outputs are never logged and never sent over HTTP.
 - No TM-R2 cut-off (Step 5B.1 H2, IP-4, IP-5, §1.9, §2.5): the shadow tiers
   build L2 and L3 with no deadline and run every layer, L4 included, under a
   `SHADOW_SAFETY_CEILING_MS` (30 s) hang guard only, never under the TM-R2
@@ -103,6 +115,7 @@ from app.groq_client import GroqClient, UpstreamError
 from app.inspection import InspectionConfig, build_inspection_bundle, prompt_hash
 from app.layers.base import DisabledLayer, IngressLayer, LayerBudgetExceeded, TightenableLayer, pin_layer
 from app.layers.l4_egress import EgressDecision, L4EgressScanner
+from app.layers.output_sanitizer import OutputSanitizer, SanitizerResult
 from app.prompting import BuiltPrompt, build_messages, build_user_content
 from app.schemas import GatewayRequest
 from app.timeout_policy import admit_after_faults, tighten_after_fault
@@ -133,6 +146,7 @@ class GatewayRuntime:
     cache: VerdictCache | None = None
     upstream: GroqClient | None = None
     pool: BoundedLayerPool | None = None
+    output_sanitizer: OutputSanitizer | None = None  # IP-10: set only when ENABLE_OUTPUT_SANITIZER is true
 
     @property
     def budgets_ms(self) -> dict[str, float]:
@@ -181,6 +195,20 @@ class VariantOutput:
     latency_ms: float
 
 
+@dataclass(frozen=True)
+class SanitizerLog:
+    """One IP-10 verdict for the separate `output_sanitizer_logs` row (never the egress cache, never content)."""
+
+    response_hash: str
+    egress_variant: str
+    sanitizer_version: str
+    mode: str
+    verdict: str  # "allow", "block", "neutralized", "timeout" or "error"
+    matched_families: tuple[str, ...]
+    latency_ms: float
+    error_message: str | None = None
+
+
 @dataclass
 class ChatResult:
     """What the route logs and returns. `content` is set only when a response is released.
@@ -206,6 +234,7 @@ class ChatResult:
     response_hash: str | None = None
     manifest_id: str | None = None
     variant_details: tuple[VariantOutput, ...] = ()
+    sanitizer_log: SanitizerLog | None = None
 
     @property
     def released(self) -> bool:
@@ -569,8 +598,96 @@ async def _release_production(
     common = dict(layer_results=layer_results, reasoning_findings=decision.reasoning_findings, egress_action=decision.action)
     if decision.action == "blocked":
         return ChatResult(outcome=Outcome.EGRESS_SAVED, blocked_by="L4", **common, **admitted)
+    if runtime.output_sanitizer is not None and decision.content is not None:
+        return await _sanitize_and_release(runtime, raw, decision, layer_results, admitted)
     outcome = Outcome.EGRESS_SAVED if decision.action == "masked" else Outcome.SUCCESS
     return ChatResult(outcome=outcome, content=decision.content, **common, **admitted)
+
+
+SANITIZER_VIEW = "output_sanitizer"
+
+
+def _sanitizer_result(verdict: str, latency_ms: float, note: str) -> LayerResult:
+    """The IP-10 evidence in the request record: layer L4, its own view, apart from the X1 to X3 `content` result."""
+    return LayerResult(
+        layer="L4",
+        view=SANITIZER_VIEW,
+        per_window_scores=(),
+        overall_score=1.0 if verdict == "block" else 0.0,
+        verdict=verdict,
+        latency_ms=latency_ms,
+        error_message=note,
+    )
+
+
+async def _sanitize_and_release(
+    runtime: GatewayRuntime,
+    raw: Mapping[str, Any],
+    decision: EgressDecision,
+    layer_results: tuple[LayerResult, ...],
+    admitted: dict[str, Any],
+) -> ChatResult:
+    """IP-10: check the released content after the egress-variant scan and before release.
+
+    Runs on the bounded pool (IP-7) with what is left of the L4 budget after the
+    egress scan (TM-R2: the two share `L4_BUDGET_MS`); a timeout or an error
+    fails closed with the uniform 503 in either mode (TM-R4). Nothing here
+    touches the IP-5 egress cache: the X1 to X3 decision was cached by
+    `_egress` before this runs, and neither the verdict nor the neutralized
+    content is ever stored (IP-5, IP-10).
+    """
+    sanitizer = runtime.output_sanitizer
+    content = decision.content
+    if sanitizer is None or content is None:
+        raise RuntimeError("the output sanitizer needs a sanitizer and released content")  # post-target guard: 503
+    log = dict(
+        response_hash=raw_response_hash(raw),
+        egress_variant=decision.variant,
+        sanitizer_version=sanitizer.version,
+        mode=sanitizer.mode,
+    )
+    common = dict(reasoning_findings=decision.reasoning_findings, **admitted)
+    budget = runtime.budget_for("L4")
+    remaining = budget - decision.latency_ms
+    if remaining <= 0.0:
+        outcome = Budgeted("timeout", None, 0.0)
+    else:
+        outcome = await run_budgeted(lambda: sanitizer.check(content), remaining, runtime.pool)
+    if outcome.status == "shed":
+        return ChatResult(outcome=Outcome.ERROR, blocked_by="load_shed", layer_results=layer_results, **common)
+    if outcome.status != "ok" or not isinstance(outcome.value, SanitizerResult):
+        status = "timeout" if outcome.status == "timeout" else "error"
+        note = (f"output sanitizer over the {budget:g} ms L4 budget (TM-R4)" if status == "timeout"
+                else f"output sanitizer raised {outcome.error or 'BadSanitizerResult'} (TM-R4)")
+        logger.error("IP-10 output sanitizer %s after %.2f ms (fails closed, TM-R4)", status, outcome.latency_ms)
+        evidence = _sanitizer_result(status, outcome.latency_ms, note)
+        return ChatResult(
+            outcome=Outcome.ERROR, blocked_by="timeout" if status == "timeout" else "internal_error",
+            layer_results=layer_results + (evidence,),
+            sanitizer_log=SanitizerLog(verdict=status, matched_families=(), latency_ms=outcome.latency_ms,
+                                       error_message=note, **log),
+            **common,
+        )
+    result: SanitizerResult = outcome.value
+    sanitizer_log = SanitizerLog(verdict=result.verdict, matched_families=result.families, latency_ms=outcome.latency_ms, **log)
+    note = f"{sanitizer.version} {sanitizer.mode}: {','.join(result.families) or 'clean'}"
+    if result.verdict == "block":
+        evidence = _sanitizer_result("block", outcome.latency_ms, note)
+        return ChatResult(
+            outcome=Outcome.EGRESS_SAVED, blocked_by="L4", egress_action="blocked",
+            layer_results=layer_results + (evidence,), sanitizer_log=sanitizer_log, **common,
+        )
+    evidence = _sanitizer_result("allow", outcome.latency_ms, note)
+    neutralized = result.verdict == "neutralized"
+    action = "masked" if neutralized or decision.action == "masked" else "none"
+    return ChatResult(
+        outcome=Outcome.EGRESS_SAVED if action == "masked" else Outcome.SUCCESS,
+        content=result.content,
+        egress_action=action,
+        layer_results=layer_results + (evidence,),
+        sanitizer_log=sanitizer_log,
+        **common,
+    )
 
 
 def combined_layer_version(layers: Sequence[IngressLayer]) -> str:
@@ -608,7 +725,7 @@ async def _run_shadow(
     if tier == "shadow_ingress_only":  # zero Groq calls; nothing is released
         return ChatResult(outcome=None, shadow=ShadowData(**shadow), layer_results=_flatten(runs), **base)
 
-    blocked_by, decided = decide_ingress(policy, runs)
+    _, decided = decide_ingress(policy, runs)  # the TM-R3 view of the layer results; nothing is released (F3)
     if runtime.upstream is None:
         return ChatResult(outcome=Outcome.ERROR, blocked_by="upstream_error", layer_results=_flatten(runs), **base)
     admitted = dict(target_called=True, model_id=runtime.upstream.model, **base)
@@ -620,7 +737,7 @@ async def _run_shadow(
     except Exception as exc:  # noqa: BLE001  a target-stage fault fails closed with target_called=True
         return _post_target_fault(admitted, _flatten(runs), False, exc)
     try:
-        return await _release_shadow(runtime, raw, cache_hit, store_key, runs, decided, blocked_by, shadow, admitted)
+        return await _release_shadow(runtime, raw, cache_hit, store_key, runs, decided, shadow, admitted)
     except Exception as exc:  # noqa: BLE001  LM-1: nothing after the target call may escape unlogged
         return _post_target_fault(admitted, _flatten(runs), cache_hit, exc, egress_variant=settings.EGRESS_VARIANT)
 
@@ -632,7 +749,6 @@ async def _release_shadow(
     store_key: str | None,
     runs: Runs,
     decided: Runs,
-    blocked_by: str | None,
     shadow: dict[str, Any],
     admitted: dict[str, Any],
 ) -> ChatResult:
@@ -642,13 +758,11 @@ async def _release_shadow(
     manifest_id = runtime.prompt.manifest.manifest_id
     records: list[EgressVariantRecord] = []
     details: list[VariantOutput] = []
-    decisions: dict[str, EgressDecision | None] = {}
     for variant in EGRESS_VARIANTS:  # IP-4: every variant on the same response, each logged independently
         run = await _egress(runtime, raw, variant)
         if run.fault is not None and run.fault.status == "shed":
             return ChatResult(outcome=Outcome.ERROR, blocked_by="load_shed", layer_results=_flatten(runs), cache_hit=cache_hit, **admitted)
         decision = run.decision
-        decisions[variant] = decision
         if decision is not None:
             record = decision.variant_record(response_hash=response_hash, manifest_id=manifest_id)
             latency = decision.latency_ms
@@ -670,11 +784,11 @@ async def _release_shadow(
         )
     shadow = dict(shadow, target_called=True, cache_hit=cache_hit, egress_variants=tuple(records))
     outputs = {v.variant: v.content for v in details}
-    active = decisions.get(settings.EGRESS_VARIANT)
-    released = None if blocked_by is not None or active is None else active.content
+    # Step 5C F3: the public route releases nothing in shadow_full_e2e; variant outputs reach harness/ only
+    # in process (run_shadow_full_e2e_detail) or through the cached egress rows.
     return ChatResult(
         outcome=None,
-        content=released,
+        content=None,
         shadow=ShadowData(**shadow),
         variant_outputs=outputs,
         layer_results=_flatten(decided),

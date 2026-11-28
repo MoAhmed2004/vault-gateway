@@ -181,6 +181,21 @@ def test_placeholder_groq_key_ignored_outside_groq_upstream(upstream):
     assert s.UPSTREAM_MODE == upstream
 
 
+def test_stub_upstream_rate_limit_default_false_and_explicit_true_refused():
+    """Step 5C.1 L-5 (TM-R7): stub is the E4 and load-rig upstream; full matrix in tests/test_rate_limit.py."""
+    assert make(UPSTREAM_MODE="stub").ENABLE_RATE_LIMITING is False
+    assert make(UPSTREAM_MODE="stub", GATEWAY_MODE="demo").ENABLE_RATE_LIMITING is False
+    assert make(UPSTREAM_MODE="stub", ENABLE_RATE_LIMITING=False).ENABLE_RATE_LIMITING is False
+    with pytest.raises(ValidationError, match="TM-R7"):
+        make(UPSTREAM_MODE="stub", ENABLE_RATE_LIMITING=True)
+
+
+def test_x0_sanitizer_refusal_is_tagged_as_a_project_decision():
+    """Step 5C.1 L-6: the X0 refusal names its label, [Project Decision, extends IP-10]."""
+    with pytest.raises(ValidationError, match=r"\[Project Decision, extends IP-10\]"):
+        make(EGRESS_VARIANT="X0", ENABLE_OUTPUT_SANITIZER=True)
+
+
 def test_failover_true_rejected():
     with pytest.raises(ValidationError, match="ALLOW_MODEL_FAILOVER"):
         make(ALLOW_MODEL_FAILOVER=True)

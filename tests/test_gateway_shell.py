@@ -40,6 +40,8 @@ class FakeSink:
     def __init__(self) -> None:
         self.records: list[Any] = []
         self.shadows: list[Any] = []
+        self.rate_limits: list[dict[str, Any]] = []
+        self.sanitizer_logs: list[dict[str, Any]] = []
         self.flushes = 0
         self.closed = False
         self.healthy = True
@@ -52,6 +54,18 @@ class FakeSink:
 
     def record_shadow(self, record: Any) -> None:
         self.shadows.append(record)
+
+    def record_rate_limit(self, record: Any) -> None:
+        from telemetry.writer import rate_limit_row
+
+        rate_limit_row(record)  # the same validation as the SQLite sink
+        self.rate_limits.append(dict(record))
+
+    def record_output_sanitizer(self, record: Any) -> None:
+        from telemetry.writer import output_sanitizer_row
+
+        output_sanitizer_row(record)
+        self.sanitizer_logs.append(dict(record))
 
     def flush(self, timeout: float = 5.0) -> None:
         self.flushes += 1
@@ -375,7 +389,9 @@ def test_non_http_scopes_pass_through_untouched():
 
 def _boom_app(tmp_path, sink):
     tiny = TokenizerLimit("tiny", 40, lambda text: math.ceil(len(text) / 2) + 2)
-    app = create_app(make_settings(tmp_path), sink, tokenizers=(tiny,))
+    # A burst of more than RATE_LIMIT_RPM requests that tests every other refusal cause, so TM-R7 is off here
+    # (tests/test_rate_limit.py covers the limiter itself).
+    app = create_app(make_settings(tmp_path, ENABLE_RATE_LIMITING=False), sink, tokenizers=(tiny,))
 
     async def boom() -> None:
         raise RuntimeError("secret internal detail: /etc/passwd at line 42")
@@ -764,6 +780,25 @@ def test_upstream_failures_are_the_uniform_503(tmp_path, sink, l4_scanner, fake)
     (record,) = sink.records
     assert (record.outcome, record.blocked_by, record.target_called, record.cache_hit) == (Outcome.ERROR, "upstream_error", True, False)
     assert record.model_id == TARGET and record.egress_action == "none"
+
+
+@pytest.mark.parametrize("number", [b"1e999", b"-1e400"])
+@pytest.mark.parametrize("cache_enabled", [True, False], ids=["cache-on", "cache-off"])
+def test_overflow_floats_in_provider_json_are_upstream_errors(tmp_path, sink, l4_scanner, number, cache_enabled):
+    """Step 5C F1 (TM-R6, IP-9, RT-V6): `1e999` is `bad_json` -> `upstream_error`, never inf or `internal_error`."""
+    fake = FakeGroq(raw_body=(
+        b'{"model": "openai/gpt-oss-20b", "x_groq": {"queue_time": ' + number + b"}, "
+        b'"choices": [{"message": {"role": "assistant", "content": "Paris."}}]}'
+    ))
+    (response,) = chat(live_app(tmp_path, sink, fake, l4_scanner, CACHE_ENABLED=cache_enabled), "What is the capital of France?")
+    assert_uniform(response)
+    assert len(fake.chat_requests) == 1
+    (record,) = sink.records
+    assert (record.outcome, record.blocked_by, record.target_called, record.cache_hit) == (Outcome.ERROR, "upstream_error", True, False)
+    if cache_enabled:  # nothing was stored, so a retry by the operator calls the target again
+        (again,) = chat(live_app(tmp_path, FakeSink(), fake, l4_scanner, CACHE_ENABLED=True), "What is the capital of France?")
+        assert_uniform(again)
+        assert len(fake.chat_requests) == 2
 
 
 def test_upstream_timeout_is_the_uniform_503(tmp_path, sink, l4_scanner):

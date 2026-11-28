@@ -20,6 +20,15 @@ records leave it None (their secrets are per session).
 `total_latency_ms` is measured from the request start in the outermost
 middleware to the moment the record is built, so it covers the body read,
 the InspectionBundle build, every layer and the target call.
+
+Step 5C adds two server-side-only rows that do not fit the frozen
+`RequestLogRecord` (and `contracts/` stays untouched): `record_rate_limit`
+(TM-R7: reason `rate_limit`, `target_called=False`, `X-Trial-ID` when sent,
+the client key as a keyed hash, never the raw IP or session value) and
+`record_output_sanitizer` (IP-10: version, mode, verdict, matched families
+and latency, a record apart from the X0 to X3 egress verdicts). They reach
+the sink through the `RateLimitSink` and `OutputSanitizerSink` Protocols
+defined here, which `telemetry.writer.SQLiteTelemetrySink` implements.
 """
 
 from __future__ import annotations
@@ -27,9 +36,10 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import MutableMapping
+import uuid
+from collections.abc import Mapping, MutableMapping
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from contracts.layer_result import LayerResult
 from contracts.modes import DETERMINISTIC_MODES
@@ -41,6 +51,41 @@ logger = logging.getLogger("vault.gateway")
 STATE_STARTED = "vault_started"
 STATE_TRIAL_ID = "vault_trial_id"
 STATE_LOGGED = "vault_logged"
+STATE_REQUEST_ID = "vault_request_id"
+STATE_SANITIZER_LOGGED = "vault_sanitizer_logged"
+
+
+@runtime_checkable
+class RateLimitSink(Protocol):
+    """Optional sink extension for TM-R7 refusals (`telemetry.writer.SQLiteTelemetrySink` implements it).
+
+    Lives in `app/`, not `contracts/` (the W2 freeze): the record is a plain
+    mapping with the `rate_limit_logs` columns, validated by the sink.
+    """
+
+    def record_rate_limit(self, record: Mapping[str, Any]) -> None: ...
+
+
+@runtime_checkable
+class OutputSanitizerSink(Protocol):
+    """Optional sink extension for IP-10 verdicts, a record apart from every X0 to X3 egress verdict."""
+
+    def record_output_sanitizer(self, record: Mapping[str, Any]) -> None: ...
+
+
+def request_context(scope: MutableMapping[str, Any]) -> dict[str, Any]:
+    """Set the per-request context once, in whichever gateway middleware runs first (outermost).
+
+    The start time (for `total_latency_ms`), the `X-Trial-ID` value (server-side
+    only, never echoed) and a random `request_id` that joins the Step 5C log
+    rows of one request.
+    """
+    state = scope_state(scope)
+    state.setdefault(STATE_STARTED, time.perf_counter())
+    if STATE_TRIAL_ID not in state:
+        state[STATE_TRIAL_ID] = parse_trial_id(scope.get("headers", []))
+    state.setdefault(STATE_REQUEST_ID, uuid.uuid4().hex)
+    return state
 
 TRIAL_ID_HEADER = b"x-trial-id"
 _TRIAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
@@ -188,3 +233,93 @@ def record_refusal(
         app, scope, outcome=outcome_for(blocked_by), prompt_hash=prompt_hash, blocked_by=blocked_by,
         layer_results=layer_results,
     )
+
+
+def _scope_text(scope: MutableMapping[str, Any], key: str) -> str | None:
+    value = scope.get(key)
+    return value if isinstance(value, str) else None
+
+
+def record_rate_limit(
+    app: Any, scope: MutableMapping[str, Any], *, key_kind: str, client_key_hash: str, rate_limit_rpm: int
+) -> None:
+    """Log one TM-R7 refusal as a `rate_limit_logs` row, server-side only (reason `rate_limit`, target not called).
+
+    The request is marked logged, so nothing else logs it. A sink without
+    `record_rate_limit` (a custom `TelemetrySink`) is reported to the Python
+    logger; logging never changes the response.
+    """
+    state = request_context(scope)
+    if state.get(STATE_LOGGED):
+        return
+    state[STATE_LOGGED] = True
+    sink = getattr(getattr(app, "state", None), "telemetry", None)
+    settings = getattr(getattr(app, "state", None), "settings", None)
+    if not isinstance(sink, RateLimitSink) or settings is None:
+        logger.error("rate-limit refusal not logged: telemetry sink without record_rate_limit or settings missing")
+        return
+    try:
+        sink.record_rate_limit(
+            {
+                "timestamp_utc": datetime.now(UTC).isoformat(),
+                "gateway_mode": settings.GATEWAY_MODE,
+                "reason": "rate_limit",
+                "request_id": state[STATE_REQUEST_ID],
+                "key_kind": key_kind,
+                "client_key_hash": client_key_hash,
+                "rate_limit_rpm": rate_limit_rpm,
+                "target_called": False,
+                "method": _scope_text(scope, "method"),
+                "path": _scope_text(scope, "path"),
+                "trial_id": state.get(STATE_TRIAL_ID),
+                "total_latency_ms": max(0.0, (time.perf_counter() - state[STATE_STARTED]) * 1000.0),
+            }
+        )
+    except Exception:  # noqa: BLE001  logging must never change the response
+        logger.exception("failed to log a rate-limit refusal")
+
+
+def record_output_sanitizer(
+    app: Any,
+    scope: MutableMapping[str, Any],
+    *,
+    prompt_hash: str,
+    response_hash: str,
+    egress_variant: str,
+    sanitizer_version: str,
+    mode: str,
+    verdict: str,
+    matched_families: tuple[str, ...],
+    latency_ms: float,
+    error_message: str | None = None,
+) -> None:
+    """Log one IP-10 verdict as an `output_sanitizer_logs` row, apart from the request record, at most once."""
+    state = request_context(scope)
+    if state.get(STATE_SANITIZER_LOGGED):
+        return
+    state[STATE_SANITIZER_LOGGED] = True
+    sink = getattr(getattr(app, "state", None), "telemetry", None)
+    settings = getattr(getattr(app, "state", None), "settings", None)
+    if not isinstance(sink, OutputSanitizerSink) or settings is None:
+        logger.error("output-sanitizer verdict not logged: telemetry sink without record_output_sanitizer")
+        return
+    try:
+        sink.record_output_sanitizer(
+            {
+                "timestamp_utc": datetime.now(UTC).isoformat(),
+                "gateway_mode": settings.GATEWAY_MODE,
+                "request_id": state[STATE_REQUEST_ID],
+                "trial_id": state.get(STATE_TRIAL_ID),
+                "prompt_hash": prompt_hash,
+                "response_hash": response_hash,
+                "egress_variant": egress_variant,
+                "sanitizer_version": sanitizer_version,
+                "mode": mode,
+                "verdict": verdict,
+                "matched_families": tuple(matched_families),
+                "latency_ms": latency_ms,
+                "error_message": error_message,
+            }
+        )
+    except Exception:  # noqa: BLE001  logging must never change the response
+        logger.exception("failed to log an output-sanitizer verdict")

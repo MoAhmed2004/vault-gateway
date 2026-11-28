@@ -5,6 +5,16 @@ loaded at import time: callers build settings with `load_settings()` or, in
 tests, with `Settings(_env_file=None, KEY=value, ...)`. Mode definitions are
 imported from `contracts.modes` so importing `app.config` never loads `Faker`
 or `phonenumbers`.
+
+v3.3.3 flags (Step 5C): `ENABLE_RATE_LIMITING` (TM-R7) and
+`ENABLE_OUTPUT_SANITIZER` (IP-10) default to None and are resolved by mode
+during validation (rate limiting on in production and demo, the sanitizer on
+in demo). Both are refused when true in `eval`, `shadow_ingress_only` and
+`shadow_full_e2e`, so neither can touch a measured run, and the sanitizer is
+also refused with `EGRESS_VARIANT=X0` [Project Decision, extends IP-10].
+Step 5C.1 L-5 (TM-R7): with `UPSTREAM_MODE=stub` (the E4 and local load-rig
+upstream) an unset `ENABLE_RATE_LIMITING` resolves to false in every mode,
+and an explicit true is refused.
 """
 
 from __future__ import annotations
@@ -49,6 +59,12 @@ TimeoutPolicyName = Literal["P-open", "P-degrade", "P-closed"]
 UpstreamModeName = Literal["groq", "ollama", "stub"]
 EgressVariantName = Literal["X0", "X1", "X2", "X3"]
 ReasoningEffortName = Literal["none", "low", "medium", "high"]
+RateLimitKeyName = Literal["ip", "session"]
+OutputSanitizerModeName = Literal["block", "neutralize"]
+
+# Mode defaults for the two v3.3.3 flags when they are left unset (TM-R7, IP-10).
+RATE_LIMIT_DEFAULT_ON: frozenset[str] = frozenset({"production", "demo"})
+OUTPUT_SANITIZER_DEFAULT_ON: frozenset[str] = frozenset({"demo"})
 
 PositiveInt = Annotated[int, Field(gt=0)]
 
@@ -69,11 +85,18 @@ def _split_candidates(value: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
+_COMMA_LIST_FIELDS = frozenset({"PROBE_CANDIDATES", "OUTPUT_IMAGE_ALLOWLIST"})
+_HOSTNAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
+_HEADER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}")
+# Headers the gateway already gives a meaning to; a session key must be a separate, opaque header (TM-R7).
+_RESERVED_SESSION_HEADERS = frozenset({"host", "content-length", "content-type", "transfer-encoding", "x-trial-id"})
+
+
 class _CommaListMixin:
-    """Parse PROBE_CANDIDATES from a comma-separated string instead of JSON."""
+    """Parse PROBE_CANDIDATES and OUTPUT_IMAGE_ALLOWLIST from a comma-separated string instead of JSON."""
 
     def prepare_field_value(self, field_name: str, field: FieldInfo, value: Any, value_is_complex: bool) -> Any:
-        if field_name == "PROBE_CANDIDATES" and isinstance(value, str):
+        if field_name in _COMMA_LIST_FIELDS and isinstance(value, str):
             text = value.strip()
             if text.startswith("["):
                 return super().prepare_field_value(field_name, field, value, value_is_complex)  # type: ignore[misc]
@@ -113,6 +136,22 @@ class Settings(BaseSettings):
     TARGET_TEMPERATURE: float = Field(default=0.0, ge=0.0, le=2.0, allow_inf_nan=False)
     TARGET_SEED: int = 0
     TARGET_REASONING_EFFORT: ReasoningEffortName | None = None
+
+    # Per-client rate limit (TM-R7, TM-R1, LLM10). None resolves by mode: true in production and demo, false in
+    # eval and both shadow tiers; true is refused in those three measured modes (it would be scored as a block).
+    ENABLE_RATE_LIMITING: bool | None = None
+    RATE_LIMIT_RPM: int = Field(default=30, ge=1)
+    RATE_LIMIT_KEY: RateLimitKeyName = "ip"
+    RATE_LIMIT_SESSION_HEADER: str = "X-Session-ID"
+    # Bound on the in-memory bucket store [Project Decision, extends TM-R7]: idle full buckets are evicted first.
+    RATE_LIMIT_MAX_CLIENTS: int = Field(default=10_000, ge=1)
+
+    # LLM05 output sanitizer (IP-10, IP-6), not an egress variant. None resolves by mode: true in demo, false in
+    # production, eval and both shadow tiers; true is refused in the three measured modes and with EGRESS_VARIANT=X0.
+    ENABLE_OUTPUT_SANITIZER: bool | None = None
+    OUTPUT_SANITIZER_MODE: OutputSanitizerModeName = "block"
+    # Image hosts an image URL may point to (exact lowercase hostnames); empty means every external image matches.
+    OUTPUT_IMAGE_ALLOWLIST: tuple[str, ...] = ()
 
     # Egress (IP-6, §2.1): X0 none, X1 Presidio, X2 + exact canary and planted PII, X3 + decoded-text and leak check
     EGRESS_VARIANT: EgressVariantName = "X2"
@@ -224,6 +263,41 @@ class Settings(BaseSettings):
     def _blank_effort_is_none(cls, value: Any) -> Any:
         return None if isinstance(value, str) and not value.strip() else value
 
+    @field_validator("ENABLE_RATE_LIMITING", "ENABLE_OUTPUT_SANITIZER", mode="before")
+    @classmethod
+    def _blank_flag_is_unset(cls, value: Any) -> Any:
+        """A blank value (`ENABLE_RATE_LIMITING=` in `.env`) means "resolve by mode"."""
+        return None if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("OUTPUT_IMAGE_ALLOWLIST", mode="before")
+    @classmethod
+    def _parse_allowlist(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return _split_candidates(value)
+        if isinstance(value, list):
+            return tuple(value)
+        return value
+
+    @field_validator("OUTPUT_IMAGE_ALLOWLIST")
+    @classmethod
+    def _allowlist_is_hostnames(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Exact hostnames only, normalized to lowercase without a trailing dot (IP-10): no scheme, port or path."""
+        hosts: list[str] = []
+        for item in value:
+            host = item.strip().lower().rstrip(".")
+            if not _HOSTNAME.fullmatch(host):
+                raise ValueError(f"OUTPUT_IMAGE_ALLOWLIST entries must be bare hostnames, got {item!r}")
+            hosts.append(host)
+        return tuple(dict.fromkeys(hosts))
+
+    @field_validator("RATE_LIMIT_SESSION_HEADER")
+    @classmethod
+    def _session_header_is_a_token(cls, value: str) -> str:
+        text = value.strip()
+        if not _HEADER_NAME.fullmatch(text) or text.lower() in _RESERVED_SESSION_HEADERS:
+            raise ValueError("RATE_LIMIT_SESSION_HEADER must be a dedicated header name (letters, digits, '-')")
+        return text
+
     @field_validator("OBJECTIVE_ID")
     @classmethod
     def _objective_id_is_identifier(cls, value: str) -> str:
@@ -239,8 +313,42 @@ class Settings(BaseSettings):
             raise ValueError("GROQ_BASE_URL must be an https:// URL")
         return text
 
+    def _resolve_mode_flags(self) -> None:
+        """Fill the unset TM-R7 and IP-10 flags from the mode (the model is frozen, so write `__dict__` once here)."""
+        if self.ENABLE_RATE_LIMITING is None:
+            # The local fixed-delay stub upstream is the E4 and load-rig target: rate limiting stays off there (TM-R7).
+            self.__dict__["ENABLE_RATE_LIMITING"] = (
+                self.GATEWAY_MODE in RATE_LIMIT_DEFAULT_ON and self.UPSTREAM_MODE != "stub"
+            )
+        if self.ENABLE_OUTPUT_SANITIZER is None:
+            self.__dict__["ENABLE_OUTPUT_SANITIZER"] = self.GATEWAY_MODE in OUTPUT_SANITIZER_DEFAULT_ON
+
     @model_validator(mode="after")
     def _startup_guards(self) -> Settings:
+        self._resolve_mode_flags()
+        if self.GATEWAY_MODE in DETERMINISTIC_MODES:
+            if self.ENABLE_RATE_LIMITING:
+                raise ValueError(
+                    f"{self.GATEWAY_MODE} refuses ENABLE_RATE_LIMITING=true: a rate-limit 503 is indistinguishable "
+                    "from a block and would distort E1 to E6, E4 and the throughput benchmarks (TM-R7)"
+                )
+            if self.ENABLE_OUTPUT_SANITIZER:
+                raise ValueError(
+                    f"{self.GATEWAY_MODE} refuses ENABLE_OUTPUT_SANITIZER=true: the LLM05 sanitizer is off in every "
+                    "measured run so the frozen X0 to X3 variants and the E1 8 x 4 table are unchanged (IP-10, IP-6)"
+                )
+        if self.ENABLE_RATE_LIMITING and self.UPSTREAM_MODE == "stub":
+            raise ValueError(
+                "UPSTREAM_MODE=stub refuses ENABLE_RATE_LIMITING=true: the stub upstream is the E4 and local load-rig "
+                "target, and a rate-limit 503 would be scored as a block or a timeout (TM-R7)"
+            )
+        # [Project Decision, extends IP-10] X0 performs no L4 scan, so the sanitizer has no egress scan to follow.
+        if self.ENABLE_OUTPUT_SANITIZER and self.EGRESS_VARIANT == "X0":
+            raise ValueError(
+                "ENABLE_OUTPUT_SANITIZER=true needs EGRESS_VARIANT X1, X2 or X3: X0 performs no L4 scan, and the "
+                "sanitizer runs after the egress-variant scan ([Project Decision, extends IP-10]); "
+                "set ENABLE_OUTPUT_SANITIZER=false for X0"
+            )
         if self.GATEWAY_MODE in DETERMINISTIC_MODES:
             secret = self.HMAC_SECRET.strip()
             if not secret or secret == DEFAULT_HMAC_SECRET or len(secret) < MIN_HMAC_SECRET_CHARS:

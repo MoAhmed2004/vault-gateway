@@ -82,7 +82,7 @@ def test_satisfies_protocol(sink):
     assert isinstance(sink, TelemetrySink)
     assert sink.healthy is True and sink.is_alive is True
     assert sink.writer_error is None and sink.writer_deaths == 0
-    assert sink.schema_version == SCHEMA_VERSION == 1
+    assert sink.schema_version == SCHEMA_VERSION == 2  # Step 5C: rate_limit_logs and output_sanitizer_logs
     assert sink.unbounded is False
 
 
@@ -854,6 +854,30 @@ def test_existing_versioned_database_missing_table_fails_fast_instead_of_recreat
     finally:
         conn.close()
     assert "shadow_records" not in tables  # the failed startup rolled back; nothing was created
+
+
+def test_a_step_5b1_version_1_database_is_refused_not_migrated(tmp_path):
+    """Step 5C: the two new tables bump SCHEMA_VERSION to 2; a version-1 file fails fast and is left untouched."""
+    db = tmp_path / "v1.db"
+    statements = [s for s in _current_statements() if "rate_limit_logs" not in s and "output_sanitizer_logs" not in s]
+    _build_db(db, statements, user_version=1)
+    with pytest.raises(RuntimeError, match="user_version=1, expected 2"):
+        SQLiteTelemetrySink(db)
+    conn = sqlite3.connect(db)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+    assert {"rate_limit_logs", "output_sanitizer_logs"}.isdisjoint(tables)
+
+
+def test_version_2_creates_the_step_5c_tables_with_their_columns(sink):
+    import telemetry.writer as writer_mod
+
+    for table, columns in (("rate_limit_logs", writer_mod.RATE_LIMIT_COLUMNS),
+                           ("output_sanitizer_logs", writer_mod.OUTPUT_SANITIZER_COLUMNS)):
+        assert {spec[0] for spec in writer_mod.EXPECTED_TABLE_COLUMNS[table]} == {"id", *columns}
+    assert writer_mod.MANAGED_TABLES == ("request_logs", "shadow_records", "rate_limit_logs", "output_sanitizer_logs")
 
 
 def test_expected_columns_cover_every_record_field():

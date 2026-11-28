@@ -266,6 +266,64 @@ def test_fullwidth_planted_digits_are_masked_from_x2(x3, built):
         assert "HONEY_PII:US_SSN" in decision.content_findings
 
 
+# Step 5C F5 (SG3, IP-6): any Unicode decimal digit (category Nd) folds to ASCII before matching
+
+DIGIT_SCRIPTS = {"arabic-indic": 0x0660, "devanagari": 0x0966, "extended-arabic-indic": 0x06F0, "bengali": 0x09E6}
+
+
+def in_script(text: str, zero: int) -> str:
+    return "".join(chr(zero + int(c)) if c.isascii() and c.isdigit() else c for c in text)
+
+
+@pytest.mark.parametrize("script", ["arabic-indic", "devanagari"])
+@pytest.mark.parametrize("entity", ["US_SSN", "PHONE_NUMBER", "CREDIT_CARD"])
+def test_planted_values_written_in_other_digit_scripts_are_masked_from_x2(x3, built, script, entity):
+    value = planted(built)[entity]
+    foreign = in_script(value, DIGIT_SCRIPTS[script])
+    assert foreign != value and not any(c.isascii() and c.isdigit() for c in foreign)
+    for variant in ("X2", "X3"):
+        decision = x3.scan(raw(f"Value: {foreign} end"), built.manifest, variant)
+        assert (decision.verdict, decision.action) == ("allow", "masked")
+        assert decision.content == f"Value: <{entity}> end"  # the source-index map masks the exact original span
+        assert f"HONEY_PII:{entity}" in decision.content_findings
+
+
+@pytest.mark.parametrize("script", ["arabic-indic", "devanagari"])
+def test_a_canary_with_digits_in_another_script_blocks_from_x2(x3, built, script):
+    canary = built.manifest.canary
+    foreign = in_script(canary, DIGIT_SCRIPTS[script])
+    assert foreign != canary
+    assert x3.scan(raw(f"token {foreign}"), built.manifest, "X1").action != "blocked"  # Presidio alone misses it
+    for variant in ("X2", "X3"):
+        decision = x3.scan(raw(f"token {foreign}"), built.manifest, variant)
+        assert (decision.verdict, decision.action, decision.content) == ("block", "blocked", None)
+        assert decision.content_findings == ("CANARY",)
+
+
+def test_every_nd_digit_script_folds_and_the_index_map_is_kept():
+    from app.layers.l4_egress import normalize_for_match
+
+    for zero in DIGIT_SCRIPTS.values():
+        text = "a" + "".join(chr(zero + d) for d in range(10)) + "-z"
+        stream, index = normalize_for_match(text)
+        assert stream == "a0123456789z" and index == [0, *range(1, 11), 12]
+
+
+def test_mixed_script_digits_inside_one_value_still_match(x3, built):
+    ssn = planted(built)["US_SSN"]
+    mixed = "".join(in_script(c, list(DIGIT_SCRIPTS.values())[i % 4]) for i, c in enumerate(ssn))
+    decision = x3.scan(raw(f"SSN {mixed}"), built.manifest, "X2")
+    assert (decision.action, decision.content) == ("masked", "SSN <US_SSN>")
+
+
+def test_non_decimal_numerals_are_not_folded():
+    """Only category Nd folds: superscripts fold through NFKC already, Roman numerals (Nl) and fractions (No) stay."""
+    from app.layers.l4_egress import normalize_for_match
+
+    assert normalize_for_match("Ⅷ")[0] == "viii"  # NFKC turns ROMAN NUMERAL EIGHT into letters, not a digit
+    assert normalize_for_match("²")[0] == "2"  # SUPERSCRIPT TWO through NFKC
+
+
 def test_x3_blocks_a_verbatim_system_prompt_leak(x3, built):
     decision = x3.scan(raw(shared_instructions(built)), built.manifest, "X3")
     assert decision.action == "blocked"
@@ -481,10 +539,12 @@ def test_another_script_still_breaks_a_match(x3, built):
     assert CANARY_LABEL not in x3.scan(raw(f"token {broken}"), built.manifest, "X2").content_findings
 
 
-def test_l4_revision_3_is_in_the_version():
+def test_l4_revision_4_is_in_the_version():
+    """Step 5C F5 bumps the revision and the match rule, so every egress row of revision 3 re-keys (upsert)."""
     from app.layers import l4_egress
 
-    assert l4_egress.L4_REVISION == 3 and l4_egress.MATCH_RULE.startswith("nfkc-casefold")
+    assert l4_egress.L4_REVISION == 4 and l4_egress.MATCH_RULE.startswith("nfkc-casefold")
+    assert l4_egress.MATCH_RULE.endswith("fold-nd-ascii")
 
 
 def test_from_cache_takes_the_lookup_latency(scanner, built):

@@ -24,7 +24,9 @@ Variants (§2.1, IP-6, AGENTS.md Rule 8):
   keeps alphanumerics only, while recording the source index of every kept
   character so a match maps back to an exact span of the original text.
   Uppercase, spaced, dotted, zero-width-split, fullwidth, NBSP-, en-dash- and
-  soft-hyphen-separated copies all match.
+  soft-hyphen-separated copies all match, and so do copies whose digits are
+  written in another script (Arabic-Indic, Devanagari, any category `Nd`
+  digit folds to ASCII, Step 5C F5, `L4_REVISION = 4`).
 - `X3`: X2 plus the decoded-text scan and the system-prompt leak check (§2.1).
   1. Decoded-text scan: the X2-masked content is decoded exactly like the
      ingress decoded view (IP-1: Unicode NFKC, `Cf` strip, Base64 and hex,
@@ -97,9 +99,10 @@ from contracts.layer_result import LayerResult
 from contracts.records import EgressVariantRecord
 
 # Revision 2: X3 (Step 5B). Revision 3: one NFKC, casefold, Cf/Z*/P*-dropping matcher for the canary
-# and the planted PII in X2 and the X3 decoded scan (Step 5B.1 M-1, closes Step 5A M1).
-L4_REVISION = 3
-MATCH_RULE = "nfkc-casefold-drop-cf-z-p-keep-alnum"
+# and the planted PII in X2 and the X3 decoded scan (Step 5B.1 M-1, closes Step 5A M1). Revision 4: the
+# matcher folds every Unicode decimal digit (category Nd) to its ASCII digit (Step 5C F5).
+L4_REVISION = 4
+MATCH_RULE = "nfkc-casefold-drop-cf-z-p-keep-alnum-fold-nd-ascii"
 PRESIDIO_SCORE_THRESHOLD = 0.4
 SCANNED_VARIANTS = ("X1", "X2", "X3")
 MANIFEST_VARIANTS = ("X2", "X3")
@@ -280,7 +283,9 @@ def normalize_for_match(text: str) -> MatchStream:
 
     Each source character is folded with Unicode NFKC and then `casefold()`;
     every resulting character in category `Cf`, `Z*` or `P*` (`Pd` included)
-    is dropped, and only alphanumerics are kept. A source character that folds
+    is dropped, and only alphanumerics are kept. Every kept character in
+    category `Nd` becomes its ASCII digit (`unicodedata.decimal`, Step 5C F5),
+    so Arabic-Indic or Devanagari digits match the ASCII value. A source character that folds
     to several characters maps each of them to its own index. Any other
     letter (Cyrillic, Greek) is kept, so it breaks a match instead of being
     skipped.
@@ -292,6 +297,10 @@ def normalize_for_match(text: str) -> MatchStream:
             category = unicodedata.category(folded)
             if category == "Cf" or category[0] in ("Z", "P") or not folded.isalnum():
                 continue
+            if category == "Nd":
+                # Step 5C F5: any Unicode decimal digit (Arabic-Indic U+0660 to U+0669, Devanagari U+0966 to
+                # U+096F, ...) folds to its ASCII digit; NFKC leaves these scripts' digits unchanged.
+                folded = str(unicodedata.decimal(folded))
             chars.append(folded)
             index.append(i)
     return "".join(chars), index

@@ -7,6 +7,7 @@ RFC 3849 for IPv6): the guard raises before any packet is sent.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import socket
 import traceback
 
@@ -47,6 +48,85 @@ def test_create_connection_and_dns_lookups_are_refused():
         socket.create_connection(REMOTE_V4, timeout=0.5)
     with pytest.raises(NetworkBlocked):
         socket.getaddrinfo("api.groq.com", 443)
+
+
+@pytest.mark.parametrize("name", ["gethostbyname", "gethostbyname_ex"])
+@pytest.mark.parametrize("host", ["api.groq.com", "203.0.113.7", "example.org"])
+def test_legacy_forward_lookups_of_remote_hosts_are_refused(name, host):
+    """Step 5C F4: the legacy resolver calls bypass getaddrinfo on some platforms, so they are guarded too."""
+    with pytest.raises(NetworkBlocked):
+        getattr(socket, name)(host)
+
+
+def test_reverse_lookup_of_a_remote_address_is_refused():
+    with pytest.raises(NetworkBlocked):
+        socket.gethostbyaddr("203.0.113.7")
+
+
+@pytest.mark.parametrize("sockaddr", [("203.0.113.7", 443), ("2001:db8::7", 443, 0, 0), ("api.groq.com", 443)])
+def test_getnameinfo_of_a_remote_address_is_refused(sockaddr):
+    """Step 5C.1 L-2: a reverse lookup by socket address is a DNS query too."""
+    with pytest.raises(NetworkBlocked):
+        socket.getnameinfo(sockaddr, socket.NI_NUMERICSERV)
+
+
+def test_getnameinfo_of_loopback_still_works():
+    host, port = socket.getnameinfo(("127.0.0.1", 8080), socket.NI_NUMERICHOST | socket.NI_NUMERICSERV)
+    assert (host, port) == ("127.0.0.1", "8080")
+
+
+def test_async_getnameinfo_is_refused_on_the_event_loop():
+    async def go() -> None:
+        loop = asyncio.get_running_loop()
+        with pytest.raises(NetworkBlocked):
+            await loop.getnameinfo(("203.0.113.7", 443))
+        host, _ = await loop.getnameinfo(("127.0.0.1", 80), socket.NI_NUMERICHOST | socket.NI_NUMERICSERV)
+        assert host == "127.0.0.1"
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("name", ["gethostbyname", "gethostbyname_ex"])
+def test_legacy_forward_lookups_of_loopback_still_work(name):
+    result = getattr(socket, name)("localhost")
+    addresses = [result] if isinstance(result, str) else result[2]
+    assert addresses and all(ipaddress.ip_address(a).is_loopback for a in addresses)
+
+
+def test_udp_sendto_a_remote_address_is_refused():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        with pytest.raises(NetworkBlocked):
+            sock.sendto(b"\x00" * 12, ("203.0.113.7", 53))
+        with pytest.raises(NetworkBlocked):
+            sock.sendto(b"\x00" * 12, 0, ("203.0.113.7", 53))  # the (data, flags, address) form
+
+
+def test_udp_sendto_loopback_still_works():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+        server.bind(("127.0.0.1", 0))
+        server.settimeout(2.0)
+        assert client.sendto(b"ping", server.getsockname()) == 4
+        assert server.recvfrom(16)[0] == b"ping"
+
+
+@pytest.mark.skipif(not hasattr(socket.socket, "sendmsg"), reason="socket.sendmsg is not available on this platform")
+def test_udp_sendmsg_to_a_remote_address_is_refused():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        with pytest.raises(NetworkBlocked):
+            sock.sendmsg([b"\x00" * 12], [], 0, ("203.0.113.7", 53))
+
+
+def test_async_udp_sendto_is_refused_on_the_event_loop():
+    async def go() -> None:
+        loop = asyncio.get_running_loop()
+        if not hasattr(loop, "sock_sendto"):
+            pytest.skip("this event loop has no sock_sendto")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.setblocking(False)
+            with pytest.raises(NetworkBlocked):
+                await loop.sock_sendto(sock, b"\x00" * 12, ("203.0.113.7", 53))
+
+    asyncio.run(go())
 
 
 def test_loopback_connections_still_work():

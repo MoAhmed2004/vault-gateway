@@ -12,7 +12,7 @@ import httpx
 import pytest
 
 from app.config import Settings
-from app.groq_client import GroqClient, ModelCheckError, UpstreamError, response_fields, target_parameters
+from app.groq_client import GroqClient, ModelCheckError, UpstreamError, parse_provider_json, response_fields, target_parameters
 from app.main import build_groq_client
 from tests.fakes import ALL_CANDIDATES, TARGET, TEST_API_KEY, FakeGroq
 
@@ -257,6 +257,28 @@ def test_non_finite_json_constants_are_bad_json(constant):
         run(_with(fake.client(), lambda c: c.complete(MESSAGES)))
     assert info.value.kind == "bad_json"
     assert len(fake.chat_requests) == 1  # refused, never retried
+
+
+@pytest.mark.parametrize("number", [b"1e999", b"-1e400", b"1.5e308000", b"-0.1e99999"])
+def test_numbers_that_overflow_to_infinity_are_bad_json(number):
+    """Step 5C F1 (TM-R6, IP-9, RT-V6): valid JSON numbers that float() turns into inf are refused, not parsed."""
+    fake = FakeGroq(raw_body=NAN_BODY.replace(b"NaN", number))
+    with pytest.raises(UpstreamError) as info:
+        run(_with(fake.client(), lambda c: c.complete(MESSAGES)))
+    assert info.value.kind == "bad_json"
+    assert len(fake.chat_requests) == 1
+
+
+@pytest.mark.parametrize("number", [b"1e999", b"-1e400"])
+def test_parse_provider_json_refuses_overflow_floats_anywhere(number):
+    with pytest.raises(ValueError, match="non-finite"):
+        parse_provider_json(b'{"a": [1, {"b": ' + number + b"}]}")
+
+
+def test_large_finite_floats_and_big_integers_are_still_accepted():
+    parsed = parse_provider_json(b'{"a": 1.7976931348623157e308, "b": -2.5e-320, "c": 123456789012345678901234567890}')
+    assert parsed["a"] == 1.7976931348623157e308 and parsed["b"] == -2.5e-320
+    assert parsed["c"] == 123456789012345678901234567890
 
 
 def test_finite_json_with_the_same_shape_is_accepted():
